@@ -64,9 +64,15 @@ def OnReceive(packet, interface=None):
         print("  waiting for the rest of this email...")
         return
     del groups[payload[:2]]
-    sender, subject, minutes, body = MeshCodec.decode_message(data)
-    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(minutes * 60))
-    print(f"\nEMAIL  from={sender!r}  subject={subject!r}  time={when}\n{body}\n")
+    message = MeshCodec.decode_message(data)
+    kind = "REPLY" if message["outbound"] else "EMAIL"
+    when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(message["minutes"] * 60))
+    print("")
+    print(f"{kind}  from={message['sender']!r}"
+          f"  subject={message['subject']!r}  thread={message['thread']:04x}"
+          f"  reply={message['reply']}  time={when}")
+    print(message["body"])
+    print("")
 
 
 if __name__ == "__main__":

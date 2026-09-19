@@ -9,7 +9,7 @@ sys.path.insert(0, str(GMAIL_DIR))
 from get_credentials import get_credentials
 from googleapiclient.discovery import build
 from MessageTransform import transform
-from MessagePayload import build_packets
+from MeshCodec import to_packets
 from MeshSend import open_link, send_packets
 
 POLL_SECONDS = 2
@@ -71,7 +71,7 @@ if __name__ == "__main__":
             for message_id in GetID(history):
                 message = ReqMessage(service, message_id)
                 email = transform(message)
-                packets = build_packets(email)
+                packets = to_packets(email)
                 print("")
                 print(f"{email['sender']}: {email['subject']}  ->  {len(packets)} packet(s)")
                 send_packets(link, packets)

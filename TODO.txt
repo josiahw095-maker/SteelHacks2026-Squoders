@@ -20,7 +20,6 @@ Priority: P0 = needed for a working demo, P1 = should have, P2 = nice to have
 How the pieces fit (files):
   MessagePing.py       Gmail polling + fetching full messages        (Josiah)
   MessageTransform.py  Gmail JSON -> {id, date, sender, subject, body} (Josiah)
-  MessagePayload.py    byte-safe text helpers (truncate_bytes etc.)   (Josiah)
   MeshCodec.py         email dict -> compressed binary packets, and back; the
                        packet format spec lives in its docstring
   provision.py         creates the private channel on both nodes
@@ -33,10 +32,10 @@ How the pieces fit (files):
 [x] P0  Wire format: compressed binary packets on the PRIVATE_APP port, see
         MeshCodec.py. Text delimited with "|" (MessagePayload.py) was the other
         candidate; binary won because base64 would cancel the compression.
-[ ] P0  Tell everyone on the team about that decision. MessagePayload.py still
-        holds an unused text wire format (FIELD_DELIM, clean_field, PACKET_BYTES
-        = 237) that MeshCodec.py does not use apart from truncate_bytes.
-        Either delete the unused parts or agree on which format is canonical.
+[x] P0  Settled: MeshCodec.py is canonical. MessagePayload.py was merged into
+        it (truncate_bytes, short_hash) and deleted; the text wire format is
+        gone. MeshCodec now carries a 2-byte thread id and REPLY/OUTBOUND flag
+        bits, and reply_packets() sends endpoint -> gateway in the same format.
 [ ] P0  Pick the endpoint app platform: native Android (Kotlin), native iOS
         (Swift), or cross-platform. The Meshtastic Python library cannot run
         on a phone, so the app needs its own BLE path (see section 5).
@@ -47,9 +46,9 @@ How the pieces fit (files):
              read messages from it (check whether an API or intent exists).
         Option (b) is probably least work; confirm the libraries can receive
         PRIVATE_APP packets outside the official app and check their licenses.
-[ ] P1  Decide one-way (email -> phone only) or two-way (replies, read receipts,
-        "send me the full body"). Assume one-way for the demo unless there is
-        spare time.
+[x] P1  Decided: TWO-WAY. The codec carries it (FLAG_OUTBOUND, reply_packets).
+        Still to build: the gateway side that receives a reply, looks the
+        thread up and sends the real email via the Gmail API.
 
 
 1. EMAIL INGESTION (gateway computer: MessagePing.py, gmail-start/)
@@ -251,8 +250,7 @@ bytes, each with a 3-byte header (2-byte email id, part/total in one byte, up to
 
 SUGGESTED ORDER OF ATTACK
 -------------------------
-1. Agree the wire format with everyone (section 0) and delete or merge the
-   unused text-format helpers in MessagePayload.py.
+1. DONE: wire format agreed, MessagePayload.py merged into MeshCodec.py.
 2. Write radio.py and the mock radio, then the gateway main loop, so a Gmail
    message can flow to the radio end to end without hardware (sections 4, 6).
 3. In parallel: pick the app platform and scaffold it, then implement
