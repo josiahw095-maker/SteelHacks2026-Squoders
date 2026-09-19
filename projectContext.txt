@@ -1,0 +1,15 @@
+This Project is an fork of the meshtastic firmware. The purpose of this project is to allow a user to get emails sent to them over the the mesh network (via the meshtastic protocol).
+
+There are four major points in this project. The computer connected to the internet (receiving emails and running our code), the LoRa node connected to the computer via Bluetooth (running default meshtastic firmware), the LoRa node connected to the Endpoint via Bluetooth (running default meshtastic firmware), and the Endpoint (typically a phone connected running our a).
+
+The flow of info is:
+
+1. Email is received on Computer running our software.
+2. Software processes email to shorten it, so it can be send efficiently over the mesh
+3. Software sends email to node via Bluetooth
+4. node encrypts and sends over the mesh
+5. end node receives the message
+5. end node sends message to Endpoint
+6. Endpoint processes message and displays it in our app
+
+ I want to strip emails received at the device receiving them (typically a computer)

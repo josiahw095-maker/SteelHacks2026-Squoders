@@ -1,5 +1,6 @@
 import os.path
 from pathlib import Path
+import sys
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -30,7 +31,11 @@ def get_credentials(token_path, secrets_path="secrets.json"):
     return creds
 
 if __name__ == "__main__":
-    creds = get_credentials("tokens/me.json")
+    if len(sys.argv) < 2:
+        print("Usage: python get_credentials.py <account-name>")
+        sys.exit(1)
+    user = sys.argv[1]
+    creds = get_credentials("tokens/" + user + ".json")
     service = build("gmail", "v1", credentials=creds)
     profile = service.users().getProfile(userId="me").execute()
     print(f"Signed in as {profile['emailAddress']}")
