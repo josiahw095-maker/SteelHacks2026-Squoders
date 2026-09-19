@@ -1,0 +1,6 @@
+# Secrets. These must never reach GitHub.
+credentials.json
+token.json
+
+.venv/
+__pycache__/
