@@ -7,8 +7,8 @@ rather than characters before it goes out.
 
 import re
 
-# mesh_pb2.Constants.DATA_PAYLOAD_LEN
-PACKET_BYTES = 237
+# mesh_pb2.Constants.DATA_PAYLOAD_LEN: sendData() raises above this.
+PACKET_BYTES = 233
 
 # Header fields are delimited; the body is last so it needs no escaping.
 FIELD_DELIM = "|"
