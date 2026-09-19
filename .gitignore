@@ -217,21 +217,16 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-<<<<<<< HEAD
 # Project secrets: never commit these
 channel.url
 channel.backup.url
-credentials.json
-token.json
-=======
+
 # --- OAuth secrets: never commit ---
 # Google's download is named client_secret_<long-id>.json; people rename it to
 # credentials.json or secrets.json. Ignore all three spellings.
 client_secret*.json
 credentials.json
 secrets.json
-# Minted at login. One per Gmail account.
 token.json
 token_*.json
 tokens/
->>>>>>> cd9ce067cdd885a6f2efc3d20ba96f00bd18479a
