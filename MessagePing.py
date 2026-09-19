@@ -8,6 +8,7 @@ sys.path.insert(0, str(GMAIL_DIR))
 
 from get_credentials import get_credentials
 from googleapiclient.discovery import build
+from MessageTransform import transform
 
 POLL_SECONDS = 2
 
@@ -58,5 +59,5 @@ if __name__ == "__main__":
         history, history_id = CheckPingRecieved(service, history_id)
         for message_id in GetID(history):
             message = ReqMessage(service, message_id)
-            print(json.dumps(message, indent = 2))
+            print(json.dumps(transform(message), indent = 2))
         time.sleep(POLL_SECONDS)
