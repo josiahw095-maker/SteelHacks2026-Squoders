@@ -5,7 +5,7 @@
 
 The first argument is the sending node's Bluetooth name or COM port, the second is the node id
 that RadioTestListen.py printed. Sends a fake email through the real pipeline:
-Gmail JSON -> MessageTransform -> BLE -> LoRa -> receiving node.
+Gmail JSON -> MessageTransform.transform -> MeshCodec -> radio -> LoRa -> receiving node.
 """
 import base64
 import sys
@@ -15,7 +15,8 @@ import time
 import meshtastic.ble_interface
 import meshtastic.serial_interface
 
-import MessageTransform
+import MeshCodec
+from MessageTransform import transform
 
 BODY = (
     "Hi all,\nThanks for joining the planning call today. Here is a summary of what "
@@ -41,10 +42,10 @@ FAKE_EMAIL = {
 
 if __name__ == "__main__":
     ble_name, dest = sys.argv[1], sys.argv[2]
-    packets = MessageTransform.TransformMessage(FAKE_EMAIL)
+    packets = MeshCodec.to_packets(transform(FAKE_EMAIL))
     print(f"{len(packets)} packet(s): {[len(p) for p in packets]} bytes")
 
-    if ble_name.upper().startswith("COM"):
+    if ble_name.upper().startswith("COM") or ble_name.startswith("/dev/"):
         iface = meshtastic.serial_interface.SerialInterface(ble_name)
     else:
         iface = meshtastic.ble_interface.BLEInterface(ble_name)

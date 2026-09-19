@@ -12,7 +12,7 @@ import meshtastic.serial_interface
 from meshtastic.protobuf import config_pb2
 from pubsub import pub
 
-import MessageTransform
+import MeshCodec
 
 groups = {}   # 2-byte email id -> packets received so far
 
@@ -27,12 +27,12 @@ def OnReceive(packet, interface=None):
 
     group = groups.setdefault(payload[:2], [])
     group.append(payload)
-    data = MessageTransform.Reassemble(group)
+    data = MeshCodec.reassemble(group)
     if data is None:
         print("  waiting for the rest of this email...")
         return
     del groups[payload[:2]]
-    sender, subject, minutes, body = MessageTransform.DecodeMessage(data)
+    sender, subject, minutes, body = MeshCodec.decode_message(data)
     when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(minutes * 60))
     print(f"\nEMAIL  from={sender!r}  subject={subject!r}  time={when}\n{body}\n")
 
