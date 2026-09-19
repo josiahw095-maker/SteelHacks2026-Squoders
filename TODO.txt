@@ -1,0 +1,251 @@
+TODO - SteelHacks2026-Squoders
+==============================
+
+Goal: email arrives at an internet-connected computer, gets stripped/shortened,
+is sent over a Meshtastic LoRa mesh, and is displayed in a phone app.
+
+Flow:  Email -> Gateway computer -> (BLE) -> Gateway node -> LoRa mesh
+       -> End node -> (BLE) -> Endpoint phone app
+
+Status today: MessagePing.py is a stub (empty function bodies, does not parse),
+MessageTransform.py is empty, no app exists. Nothing runs yet. The project is
+NOT a firmware fork; both nodes run stock Meshtastic firmware.
+
+Legend: [ ] not started   [~] partly started   [x] done
+Priority: P0 = needed for a working demo, P1 = should have, P2 = nice to have
+
+
+0. DECISIONS TO MAKE FIRST (they change the rest of the work)
+-------------------------------------------------------------
+[ ] P0  Pick the endpoint app platform: native Android (Kotlin), native iOS
+        (Swift), or cross-platform. The Meshtastic Python library cannot run
+        on a phone, so the app needs its own BLE path (see section 5).
+[ ] P0  Decide how the endpoint talks to the end node. Options:
+          a) Our app speaks the Meshtastic BLE protocol directly.
+          b) Our app uses the official Meshtastic Android/iOS client library.
+          c) Use the stock Meshtastic app for the radio link and have our app
+             read messages from it (check whether an API or intent exists).
+        Option (b) is probably least work; confirm the libraries are usable
+        outside the official app and check their licenses.
+[ ] P0  Decide the wire format for an email over the mesh (section 3). Both the
+        gateway and the endpoint must agree on it, so write it down before
+        coding either side.
+[ ] P1  Decide one-way (email -> phone only) or two-way (replies, read receipts,
+        "send me the full body"). Assume one-way for the demo unless there is
+        spare time. MessagePing.py's ReqMessage() hints at a request/response
+        design; decide whether that is still wanted.
+[x] P1  Email provider: Gmail, via the Gmail API (not IMAP). See section 1.
+
+
+1. EMAIL INGESTION (gateway computer, MessagePing.py)
+-----------------------------------------------------
+Design: CheckPingRecieved() loops, polling Google for new messages. Each new
+message ID is passed to ReqMessage(), which calls the Gmail API and returns the
+message JSON. That JSON goes on to MessageTransform.py (section 2).
+[ ] P0  Google Cloud setup: create a project, enable the Gmail API, configure the
+        OAuth consent screen (add team accounts as test users), and download an
+        OAuth client credentials file. Use the gmail.readonly scope only.
+[ ] P0  OAuth flow: use google-api-python-client + google-auth-oauthlib. First run
+        opens a browser and saves a token; later runs reuse and refresh it.
+        Add credentials.json and token.json to .gitignore BEFORE creating them
+        (neither is ignored today). Never commit them.
+[ ] P0  Implement CheckPingRecieved(): poll for new mail with a sleep between
+        polls (about 10-30 s). Preferred: users.history.list with a saved
+        startHistoryId (cheap "anything new since X?"). Simpler alternative:
+        users.messages.list with q="is:unread" or newer_than:, plus your own
+        processed-ID tracking. Remember users.messages.list only returns IDs,
+        so each hit needs a users.messages.get call.
+[ ] P0  MessagePing.py currently has a `while True` under __main__ calling
+        CheckPingRecieved(); if the loop moves inside the function, remove the
+        outer one so there is only one loop.
+[ ] P0  Implement ReqMessage(id): users.messages.get(userId="me", id=id,
+        format="full") and return the JSON. Body text is base64url-encoded in
+        payload.parts[] (possibly nested multipart); decoding is
+        MessageTransform.py's job. format="metadata" is much smaller if only
+        headers are needed.
+[ ] P0  Persist state: the last-seen historyId (or set of processed message IDs)
+        in a small local file/SQLite db, so restarts neither resend old mail nor
+        skip new mail. historyId can expire (history.list returns 404); on that
+        error fall back to a fresh messages.list and reset the stored ID.
+[ ] P1  Filtering: use labelIds (INBOX) and/or a q= search (from:, label:) plus a
+        sender allowlist so only chosen mail goes over the mesh. Airtime is
+        scarce and the mesh is shared; forwarding a whole inbox is not ok.
+[ ] P1  Handle failure: network errors, expired tokens, HTTP 429/5xx should retry
+        with exponential backoff instead of crashing the loop.
+[ ] P1  Decide how the loop hands messages to the rest of the program: a callback,
+        a queue, or a generator, so the radio side (section 4) is not blocked by
+        Gmail polling.
+[ ] P2  Support multiple accounts or a recipient mapping (which email goes to
+        which end node).
+[ ] P2  Push instead of poll: Gmail users.watch + Google Pub/Sub. Needs a public
+        endpoint or pull subscription; not worth it for the hackathon.
+
+
+2. STRIPPING AND SHORTENING (MessageTransform.py, currently empty)
+------------------------------------------------------------------
+Meshtastic text payloads are small (roughly 200-230 bytes per packet), and LoRa
+airtime is slow and duty-cycle limited. This is the core of the project, so the
+transform needs to be aggressive and deterministic.
+[ ] P0  Parse MIME: prefer text/plain; if only text/html, convert to text
+        (e.g. BeautifulSoup or html2text). Ignore attachments and inline images
+        (optionally note "2 attachments").
+[ ] P0  Strip: quoted replies ("> ..." and "On <date>, X wrote:" blocks),
+        signatures ("-- " delimiter, "Sent from my iPhone"), legal/unsubscribe
+        footers, tracking links, excess whitespace and blank lines.
+[ ] P0  Extract only the fields we send: sender (name or short address),
+        subject, and the shortened body. Decode RFC 2047 headers and non-UTF-8
+        charsets properly.
+[ ] P0  Shorten to a byte budget, not a character budget. Count UTF-8 bytes;
+        emoji and non-Latin text use 2-4 bytes each.
+[ ] P1  Shortening strategies, roughly in order of effort:
+          1. Truncate with an ellipsis marker.
+          2. URL shortening or removal (replace with "[link]").
+          3. Abbreviation/dictionary substitution.
+          4. Compression (zlib/brotli/smaz-style) of the body; check that it
+             actually wins at ~200 bytes since headers add overhead.
+          5. LLM summarization of the body (optional; needs an API key and
+             network on the gateway, and must be deterministic enough to demo).
+[ ] P1  Make the output configurable: max bytes per message, max chunks per
+        email, and whether to send subject-only when the body is long.
+[ ] P1  Unit tests with real-world samples: newsletters, HTML-only mail,
+        forwarded chains, non-English mail, empty body. Keep fixtures in a
+        tests/ folder.
+
+
+3. MESSAGE FORMAT AND CHUNKING (shared gateway <-> endpoint contract)
+---------------------------------------------------------------------
+[ ] P0  Define the envelope, for example:
+          <ver>|<email-id>|<part>/<total>|<from>|<subject>|<body...>
+        Keep header overhead tiny. Only the first chunk needs from/subject.
+[ ] P0  Chunking: split on UTF-8 boundaries (never mid-codepoint) so each chunk
+        fits one packet. Include sequence numbers so the endpoint can
+        reassemble out-of-order or partial deliveries.
+[ ] P0  Reassembly at the endpoint with a timeout: show partial mail marked
+        "incomplete" rather than waiting forever.
+[ ] P1  Reliability: Meshtastic has want_ack and routing-level retries for
+        direct messages, but broadcast is unreliable. Send to a specific node
+        ID with acks enabled and handle NAK/timeout. Decide on retry limit.
+[ ] P1  Deduplicate on email-id so a retried chunk does not show twice.
+[ ] P1  Rate limiting: space chunks out so we do not flood the mesh or hit the
+        radio's duty-cycle limits. Add a queue between the transform and the
+        radio.
+[ ] P2  Version byte in the envelope so the format can evolve without breaking
+        older apps.
+
+
+4. GATEWAY <-> NODE OVER BLUETOOTH (Python)
+-------------------------------------------
+Plan: use the official `meshtastic` Python package (pip install meshtastic),
+which provides both the CLI and a library. BLE goes through
+meshtastic.ble_interface.BLEInterface (built on `bleak`). Verify the exact
+constructor signature and current behavior against the docs before relying on it.
+[ ] P0  Add requirements.txt (meshtastic, bleak, pypubsub, google-api-python-client,
+        google-auth-oauthlib, plus an HTML-to-text lib).
+[ ] P0  Get the two physical nodes and pair the gateway node with the gateway
+        computer. Check with `meshtastic --ble-scan` and
+        `meshtastic --ble <name> --info`.
+[ ] P0  Prove the link with the CLI first: `meshtastic --ble <name> --sendtext
+        "hello"` and confirm the end node receives it, before writing code.
+[ ] P0  Write a small wrapper module (e.g. radio.py) that:
+          - opens a BLEInterface,
+          - exposes send_text(text, dest_id, want_ack),
+          - subscribes to the "meshtastic.receive" pubsub topic,
+          - handles connection loss and reconnects.
+[ ] P0  Fix MessagePing.py: CheckPingRecieved(), GetID() and ReqMessage() have no
+        bodies (syntax error), and ReqMessage() returns an undefined `message`.
+        Replace the polling loop with the pubsub receive callback if the ping
+        concept is kept. Also fix the "Recieved" spelling.
+[ ] P1  Confirm pairing details: whether the firmware version needs a PIN, and
+        whether the Meshtastic node allows only one BLE client at a time (it
+        usually does, so the phone app and gateway cannot share a node).
+[ ] P1  Configure the mesh: matching region/frequency on both nodes, same
+        channel and PSK, sensible modem preset (long-range presets are slower
+        per byte; measure the throughput trade-off).
+[ ] P1  Look up the destination node ID (!xxxxxxxx) automatically from
+        interface.nodes instead of hard-coding it.
+[ ] P2  Fall back to serial or TCP interfaces if BLE is flaky on the demo
+        machine. The library supports both with the same API.
+[ ] P2  Windows-specific: test BLE reliability with bleak on the demo laptop;
+        keep a Linux/Raspberry Pi fallback in mind.
+
+
+5. ENDPOINT APP (phone)
+-----------------------
+[ ] P0  Scaffold the app in the chosen platform (see section 0).
+[ ] P0  BLE connection to the end node: scan, pair, reconnect, and show
+        connection state.
+[ ] P0  Receive Meshtastic text packets, parse our envelope, reassemble chunks.
+[ ] P0  Inbox UI: list of emails (sender, subject, time), detail view with the
+        body, and an indicator for incomplete/partial messages.
+[ ] P1  Persist messages locally (SQLite/Room/CoreData) so history survives
+        restarts.
+[ ] P1  Notifications for new mail while the app is in the background; check BLE
+        background rules on the chosen OS.
+[ ] P1  Handle the app and the stock Meshtastic app competing for the same node
+        connection (usually one BLE client at a time).
+[ ] P2  Show signal info (RSSI/SNR, hop count) from the packet for demo appeal.
+[ ] P2  Settings screen: node selection, and later filters.
+[ ] P2  Decrypting is handled by the node with the channel key; the app only sees
+        plaintext. Note in the docs that we rely on Meshtastic's channel
+        encryption and add no end-to-end email encryption.
+
+
+6. TESTING AND DEMO
+-------------------
+[ ] P0  End-to-end test with real hardware: send a real email, watch it arrive on
+        the phone. Record latency and the number of chunks.
+[ ] P0  Prepare a fallback demo: pre-recorded video and/or a mock radio layer
+        (fake BLEInterface that loops chunks back) so the demo survives dead
+        batteries, RF noise or BLE trouble.
+[ ] P1  Range test: two nodes in the same room prove nothing; test across
+        buildings or outdoors and note the numbers for the pitch.
+[ ] P1  Test on emails of varying lengths, including one that exceeds the max
+        chunk count, to confirm truncation behaves.
+[ ] P1  Bring spares: charged nodes, USB cables, antennas, a backup laptop.
+[ ] P2  Automated tests for transform/chunk/reassemble (pure functions, easy to
+        test without hardware).
+
+
+7. SECURITY AND PRIVACY
+-----------------------
+[ ] P0  Keep credentials out of git: credentials.json, token.json and .env
+        (only .env is ignored today). Double-check before every commit.
+[ ] P1  Understand what Meshtastic encrypts: the default channel key is public
+        and known. Use a private channel with a generated PSK for anything real,
+        and never send sensitive email on the default channel.
+[ ] P1  Only forward mail from an allowlist; do not leak arbitrary inbox content
+        over a radio anyone in range might be able to decode.
+[ ] P2  Consider redacting patterns like verification codes or account numbers
+        by default, or explicitly allowing them.
+[ ] P2  Regulatory note: LoRa runs in unlicensed ISM bands (915 MHz in the US)
+        with duty-cycle/power limits set by the region setting. Keep the region
+        configured correctly.
+
+
+8. DOCS AND REPO HYGIENE
+------------------------
+[ ] P0  Update README.md: the gateway uses the official Meshtastic Python
+        library over BLE (not a firmware fork), and add real setup/run
+        instructions once they exist.
+[ ] P1  Add requirements.txt and a short "Getting started" that another team
+        member can follow from scratch (pair nodes, set env vars, run).
+[ ] P1  Replace projectContext.txt with, or fold it into, the README so the
+        notes do not drift. It still calls the project a firmware fork.
+[ ] P1  Pick a license and add a LICENSE file. Note that Meshtastic firmware is
+        GPL-3.0 and the Python library is Apache-2.0; check compatibility if
+        any of their code is copied in rather than used as a dependency.
+[ ] P1  Add team names to the README.
+[ ] P2  Add a tests/ folder and a simple CI check (python -m compileall / pytest).
+[ ] P2  Put the message-format spec (section 3) in docs/ so the gateway and app
+        developers work from one source of truth.
+
+
+SUGGESTED ORDER OF ATTACK
+-------------------------
+1. Get two nodes talking with the CLI (section 4, first three items).
+2. Write the shared message format (section 3) so gateway and app work can run in
+   parallel.
+3. In parallel: transform + chunking with tests (sections 2-3), and app
+   scaffold + BLE receive (section 5).
+4. Wire up Gmail ingestion (section 1) and the radio wrapper (section 4).
+5. End-to-end run, then fallback demo, then polish (section 6).

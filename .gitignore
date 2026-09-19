@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project secrets: never commit these
+channel.url
+channel.backup.url
+credentials.json
+token.json
