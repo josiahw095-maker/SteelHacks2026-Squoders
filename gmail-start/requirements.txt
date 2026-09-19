@@ -1,0 +1,3 @@
+# Just enough to talk to Gmail. Pub/Sub comes later.
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.1
