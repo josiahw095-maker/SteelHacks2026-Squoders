@@ -1,6 +1,8 @@
 import base64
 import html
 import re
+from email.header import decode_header, make_header
+from email.utils import parseaddr
 
 def get_header(message, name):
     """Find one header, case insensitively. Returns "" if abesnt"""
@@ -9,6 +11,31 @@ def get_header(message, name):
             return header["value"]
 
     return ""
+
+def decode_mime_words(value):
+    """Decode RFC 2047 encoded-words (=?UTF-8?B?...?=) into plain text."""
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except (UnicodeDecodeError, LookupError, ValueError):
+        return value
+
+
+def parse_sender(from_header):
+    """Shorten a From header to something worth spending mesh bytes on.
+
+    'Alice Smith <alice@example.com>' -> 'Alice Smith'
+    'alice@example.com'               -> 'alice'
+    """
+    name, address = parseaddr(from_header or "")
+    name = decode_mime_words(name).strip().strip('"').strip()
+    if name:
+        return name
+    if address:
+        return address.split("@", 1)[0]
+    return decode_mime_words(from_header).strip()
+
 
 def decode(data):
     padding = "=" * (-len(data) % 4)
@@ -49,8 +76,8 @@ def transform(message):
     return {
         "id" : message["id"],
         "date": int(message.get("internalDate", 0)) // 1000,
-        "sender": get_header(message, "From"),
-        "subject": get_header(message, "Subject"),
+        "sender": parse_sender(get_header(message, "From")),
+        "subject": decode_mime_words(get_header(message, "Subject")),
         "body": body.strip(),
                            
     }
