@@ -2,7 +2,10 @@
 
     Gmail JSON --MessageTransform.transform--> email dict
                --to_packets-->  [bytes, ...]  --(radio)-->
-               --reassemble + decode_message-->  (sender, subject, minutes, body)
+               --reassemble + decode_message-->  dict
+
+A reply travels the other way with reply_packets(); both directions share one
+record layout, so the endpoint app implements the codec only once.
 
 The packets are raw bytes, not text. Send them with the Meshtastic library's
 sendData on the private port (PortNum.PRIVATE_APP, which is its default), not
@@ -13,15 +16,24 @@ Message (the bytes that get chunked):
 
     <flag: 1 byte> <rest>
 
-    flag    0 = rest is the raw record, 1 = rest is the record after raw deflate
-            using DICT. pack() keeps whichever is smaller. The upper 7 bits are
-            reserved (use them for a format version if this changes).
+    bit 0  DEFLATE   rest is the record after raw deflate using DICT; pack()
+                     sets it only when that is smaller than the raw record
+    bit 1  REPLY     this email is itself a reply (its In-Reply-To was set)
+    bit 2  OUTBOUND  endpoint -> gateway (a reply being sent) rather than
+                     gateway -> endpoint
+    bits 3-7         reserved (use them for a format version if this changes)
 
-    record  <time: 4 bytes, big-endian uint32, UTC minutes since the Unix epoch>
-            <sender> "\\n" <subject> "\\n" <body>          (all UTF-8)
+    record  <time:   4 bytes, big-endian uint32, UTC minutes since the epoch>
+            <thread: 2 bytes, big-endian uint16, crc32 of the Gmail threadId>
+            <sender> "\n" <subject> "\n" <body>          (all UTF-8)
 
-Sender and subject never contain "\\n", so the receiver parses the text with
-split(b"\\n", 2). The body comes last and may contain newlines.
+Sender and subject never contain "\n", so the receiver parses the text with
+split(b"\n", 2). The body comes last and may contain newlines. An outbound
+reply leaves sender and subject empty: the gateway already holds the address,
+the Message-ID and the thread, and builds the real email from those.
+
+thread groups a conversation; the 2-byte id in the chunk header groups the
+packets of one message. For the first mail in a thread the two are equal.
 
 Chunk (each mesh packet, at most MAX_PAYLOAD bytes):
 
@@ -31,27 +43,29 @@ Chunk (each mesh packet, at most MAX_PAYLOAD bytes):
     part    0-based index of this packet
     total   number of packets (1..15)
 
-Text is shortened BEFORE it is compressed, and the message is compressed BEFORE it
-is split. Dropping packets from the end of a compressed stream would make it
-undecodable, so encode() trims the body until everything fits in MAX_CHUNKS packets.
+Text is shortened BEFORE it is compressed, and the message is compressed BEFORE
+it is split. Dropping packets from the end of a compressed stream would make it
+undecodable, so encode() trims the body until everything fits in MAX_CHUNKS.
 
 DICT, MAX_SENDER and MAX_SUBJECT are part of the format. The endpoint app must
 embed the identical DICT bytes; changing it breaks every deployed app.
 """
 import re
 import struct
+import time
 import zlib
 
-from MessagePayload import truncate_bytes
-
-MAX_PAYLOAD = 200   # bytes per mesh packet, conservative (the firmware limit is ~233)
+MAX_PAYLOAD = 200   # bytes per mesh packet, conservative (the firmware limit is 233)
 MAX_CHUNKS = 3      # the body is trimmed until the message fits in this many packets
 MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
 HEADER = 3          # bytes of chunk header (id + part/total)
+RECORD_HEAD = 6     # bytes of record header (4 time + 2 thread)
 ELLIPSIS = "…"  # 3 bytes in UTF-8, marks text that was cut
 
-FLAG_RAW, FLAG_DEFLATE = 0, 1
+FLAG_DEFLATE = 0x01
+FLAG_REPLY = 0x02
+FLAG_OUTBOUND = 0x04
 
 # Shared compression dictionary. Deflate favors the END of the dictionary, so
 # the most common material goes last. Replace with phrases mined from real mail.
@@ -66,7 +80,27 @@ DICT = (
 )
 
 
-# --- Shrinking the text ------------------------------------------------------
+# --- Byte-safe text helpers (merged in from the old MessagePayload.py) -------
+
+def truncate_bytes(text, max_bytes):
+    """Cut text to at most max_bytes of UTF-8, never splitting a character."""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+
+    cut = max_bytes
+    # Walk back off any continuation byte (0b10xxxxxx) so the cut lands on a
+    # character boundary.
+    while cut > 0 and raw[cut] & 0xC0 == 0x80:
+        cut -= 1
+
+    return raw[:cut].decode("utf-8", errors="ignore")
+
+
+def short_hash(text):
+    """The 16-bit id used for both the chunk group and the thread."""
+    return zlib.crc32((text or "").encode()) & 0xFFFF
+
 
 def one_line(text):
     return " ".join(text.split())
@@ -79,23 +113,67 @@ def shorten(text, limit):
     return truncate_bytes(text, limit - len(ELLIPSIS.encode())).rstrip() + ELLIPSIS
 
 
-def strip_body(body):
-    """Drop everything that is not the new content of the email."""
-    lines = []
-    for line in body.replace("\r\n", "\n").split("\n"):
-        if line.startswith(">"):                              # quoted reply
-            continue
-        if re.match(r"On .+ wrote:\s*$", line) or line.rstrip() == "--":
-            break                                             # reply header / signature
-        lines.append(line)
+# --- Shrinking the text ------------------------------------------------------
+
+# Everything from the first marker to the end of the body is reply history or a
+# signature, so we cut there rather than filtering line by line.
+QUOTE_MARKERS = [
+    re.compile(r"^>"),                                          # quoted line
+    re.compile(r"\bwrote:\s*$"),                                # "... Alice <a@x> wrote:"
+    re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}", re.I),  # Outlook
+    re.compile(r"^\s*From:\s+\S"),                              # Outlook header block
+    re.compile(r"^\s*_{5,}\s*$"),                               # Outlook rule
+    re.compile(r"^--\s*$"),                                     # signature delimiter
+    re.compile(r"^\s*Sent from my \w+", re.I),                  # mobile signature
+    re.compile(r"^\s*Unsubscribe\b", re.I),                     # bulk mail footer
+]
+
+# Gmail wraps "On <date> <name> wrote:" across two lines, so a match on the
+# second half would leave the first half behind. These back up to its start.
+ATTRIBUTION_OPEN = re.compile(r"^\s*On\b")
+WROTE_END = re.compile(r"\bwrote:\s*$")
+
+
+def quote_cut(lines):
+    """Index of the first line of reply history, or None if there is none."""
+    cut = None
+    for index, line in enumerate(lines):
+        if any(marker.search(line) for marker in QUOTE_MARKERS):
+            cut = index
+            break
+
+    if cut is None:
+        return None
+
+    if WROTE_END.search(lines[cut]) and not ATTRIBUTION_OPEN.search(lines[cut]):
+        for back in range(cut - 1, max(-1, cut - 3), -1):
+            if ATTRIBUTION_OPEN.search(lines[back]):
+                cut = back
+                break
+
+    return cut
+
+
+def tidy(lines):
+    """Collapse the whitespace and spend no bytes on full URLs."""
     text = "\n".join(lines)
-    text = re.sub(r"https?://\S+", "[link]", text)            # URLs are expensive
+    text = re.sub(r"https?://\S+", "[link]", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
 
-    # TODO: "Sent from my iPhone", unsubscribe/legal footers, abbreviation
-    # dictionary, optional LLM summary (only if it beats plain truncation).
+
+def strip_body(body):
+    """Drop everything that is not the new content of the email.
+
+    Falls back to the whole body when stripping would leave nothing, so a
+    forward-only mail still carries something.
+    """
+    lines = body.replace("\r\n", "\n").split("\n")
+    cut = quote_cut(lines)
+    if cut is None:
+        return tidy(lines)
+    return tidy(lines[:cut]) or tidy(lines)
 
 
 # --- Packing, compressing and splitting -------------------------------------
@@ -110,50 +188,65 @@ def inflate(data):
     return d.decompress(data) + d.flush()
 
 
-def pack(sender, subject, minutes, body):
+def pack(sender, subject, minutes, thread, body, flags):
     """flag byte + (raw or deflated) record; whichever is smaller."""
-    record = struct.pack(">I", minutes) + b"\n".join(
+    record = struct.pack(">IH", minutes, thread) + b"\n".join(
         (sender.encode(), subject.encode(), body.encode()))
     packed = deflate(record)
     if len(packed) < len(record):
-        return bytes([FLAG_DEFLATE]) + packed
-    return bytes([FLAG_RAW]) + record
+        return bytes([flags | FLAG_DEFLATE]) + packed
+    return bytes([flags]) + record
 
 
-def encode(sender, subject, minutes, body):
+def encode(sender, subject, minutes, thread, body, flags):
     """Pack, trimming the body (marked with an ellipsis) until the result fits
     in MAX_CHUNKS packets. Trimming happens on the text, before compression."""
     limit = MAX_CHUNKS * (MAX_PAYLOAD - HEADER)
     while True:
-        data = pack(sender, subject, minutes, body)
+        data = pack(sender, subject, minutes, thread, body, flags)
         if len(data) <= limit or not body:
             return data
         size = len(body.encode())
         body = shorten(body, size * 9 // 10) if size > 12 else ""
 
 
-def chunk(email_id, data):
+def chunk(group_id, data):
     """Split into packets of at most MAX_PAYLOAD bytes, each with the 3-byte
     header described at the top of the file."""
     room = MAX_PAYLOAD - HEADER
     pieces = [data[i:i + room] for i in range(0, len(data), room)]
-    mid = zlib.crc32(email_id.encode()) & 0xFFFF
+    mid = short_hash(group_id)
     return [struct.pack(">HB", mid, i << 4 | len(pieces)) + piece
             for i, piece in enumerate(pieces)]
 
 
 def to_packets(email):
-    """The dict MessageTransform.transform() returns -> list of bytes, one per packet."""
+    """The dict MessageTransform.transform() returns -> one packet per chunk."""
     sender = shorten(one_line(email["sender"]), MAX_SENDER)
     subject = shorten(one_line(email["subject"]), MAX_SUBJECT)
-    minutes = email["date"] // 60
-    return chunk(email["id"], encode(sender, subject, minutes, strip_body(email["body"])))
+    thread = short_hash(email.get("thread") or email["id"])
+    flags = FLAG_REPLY if email.get("reply") else 0
+    data = encode(sender, subject, email["date"] // 60, thread,
+                  strip_body(email["body"]), flags)
+    return chunk(email["id"], data)
+
+
+def reply_packets(thread_id, body, message_id=""):
+    """A reply heading endpoint -> gateway, in the same format.
+
+    Sender and subject are left empty: the gateway looks the original message
+    up by thread and builds the real email, quoting included, when it sends.
+    """
+    thread = short_hash(thread_id)
+    data = encode("", "", int(time.time()) // 60, thread, one_line(body),
+                  FLAG_OUTBOUND | FLAG_REPLY)
+    return chunk(message_id or thread_id, data)
 
 
 # --- Inverse: what the endpoint app has to do (kept here as the reference) ---
 
 def reassemble(packets):
-    """Packets of ONE email, any order -> the message bytes, or None if any
+    """Packets of ONE message, any order -> the message bytes, or None if any
     packet is missing. The app should group packets by their 2-byte id first."""
     parts, total = {}, None
     for packet in packets:
@@ -166,17 +259,28 @@ def reassemble(packets):
 
 
 def decode_message(data):
-    """Message bytes -> (sender, subject, minutes, body)."""
-    record = inflate(data[1:]) if data[0] == FLAG_DEFLATE else data[1:]
-    (minutes,) = struct.unpack(">I", record[:4])
-    sender, subject, body = record[4:].split(b"\n", 2)
-    return sender.decode(), subject.decode(), minutes, body.decode()
+    """Message bytes -> the fields, whichever direction they travelled."""
+    flags = data[0]
+    record = inflate(data[1:]) if flags & FLAG_DEFLATE else data[1:]
+    minutes, thread = struct.unpack(">IH", record[:RECORD_HEAD])
+    sender, subject, body = record[RECORD_HEAD:].split(b"\n", 2)
+    return {
+        "minutes": minutes,
+        "thread": thread,
+        "reply": bool(flags & FLAG_REPLY),
+        "outbound": bool(flags & FLAG_OUTBOUND),
+        "sender": sender.decode(),
+        "subject": subject.decode(),
+        "body": body.decode(),
+    }
 
 
 if __name__ == "__main__":
-    # Smoke test with a fake parsed email, including a round trip.
+    # Smoke test with a fake parsed email, including a round trip both ways.
     fake = {
         "id": "18c0ffee1234abcd",
+        "thread": "18c0ffee0000aaaa",
+        "reply": True,
         "date": 1790000000,
         "sender": "Ada Lovelace",
         "subject": "Lunch?",
@@ -185,4 +289,7 @@ if __name__ == "__main__":
     packets = to_packets(fake)
     for packet in packets:
         print(len(packet), packet.hex())
-    print(decode_message(reassemble(reversed(packets))))
+    print("inbound  ->", decode_message(reassemble(reversed(packets))))
+
+    back = reply_packets("18c0ffee0000aaaa", "Noon works, see you there.")
+    print("outbound ->", decode_message(reassemble(back)))

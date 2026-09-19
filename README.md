@@ -37,8 +37,7 @@ The phone does **not** need the channel key. Only the two radios hold it. The en
 | --- | --- |
 | [MessagePing.py](MessagePing.py) | Polls Gmail history for new mail and fetches full messages. |
 | [MessageTransform.py](MessageTransform.py) | Parses a Gmail message into `{id, date, sender, subject, body}`. |
-| [MessagePayload.py](MessagePayload.py) | Byte-safe text helpers shared by the packing code. |
-| [MeshCodec.py](MeshCodec.py) | Packs an email into compressed binary packets and decodes them again. Also the format spec for the phone app. |
+| [MeshCodec.py](MeshCodec.py) | Packs an email into compressed binary packets and decodes them again, in both directions. Also the format spec for the phone app. |
 | [provision.py](provision.py) | Creates a new private channel and puts it on both nodes. |
 | [RadioTestSend.py](RadioTestSend.py), [RadioTestListen.py](RadioTestListen.py) | Hardware test: send a fake email from one node and receive it on another. |
 | [gmail-start/](gmail-start) | Gmail OAuth helper and its requirements. |
