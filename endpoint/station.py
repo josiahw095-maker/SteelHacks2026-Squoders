@@ -22,7 +22,15 @@ GROUP_TIMEOUT = 300
 
 # How long a message may stall before we ask for the missing parts, and
 # how many times we are willing to ask.
+#
+# Each further wait is REQUEST_BACKOFF times the last. Asking again while the
+# gateway is still working through the previous request is worse than useless:
+# it spends airtime on parts already in flight, and the answer to it arrives
+# after the message is complete. The gateway needs roughly two seconds per
+# missing part plus the request's own flight, so the first wait covers a full
+# resend and the backoff covers a slow or lossy one.
 REQUEST_AFTER = 20
+REQUEST_BACKOFF = 2.0
 MAX_REQUESTS = 3
 
 # Lines kept for the live feed on screen.
@@ -249,14 +257,15 @@ class Station:
 
         with self.lock:
             for key, group in self.groups.items():
-                if now - group["seen"] < REQUEST_AFTER:
+                asked = group.get("requests", 0)
+                if now - group["seen"] < REQUEST_AFTER * REQUEST_BACKOFF ** asked:
                     continue
-                if group.get("requests", 0) >= MAX_REQUESTS:
+                if asked >= MAX_REQUESTS:
                     continue
                 missing = MeshCodec.missing_parts(group["packets"])
                 if not missing:
                     continue
-                group["requests"] = group.get("requests", 0) + 1
+                group["requests"] = asked + 1
                 group["seen"] = now          # back off before asking again
                 asks.append((int.from_bytes(key, "big"), missing))
 

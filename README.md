@@ -117,8 +117,11 @@ and a channel, or they will not hear each other.
 
 ### Speed and reliability
 
-Packets are paced to the radio's real airtime, addressed to one node, and each
-is acknowledged before the next goes out. Three things you can tune:
+Packets are paced to the radio's real airtime and addressed to one node where
+one is known. A single packet waits for its acknowledgment; a longer message
+does not, because a lost ack costs a timeout and those add up down a train
+until the endpoint gives up waiting and asks for the parts again. Missing
+parts are repaired by the resend request instead. Three things you can tune:
 
 - **Preset.** The default, LONG_FAST, is about 1 kbps: one packet is ~2 s on the
   air. SHORT_FAST is roughly ten times quicker and plenty across a room. Both
@@ -136,9 +139,11 @@ is acknowledged before the next goes out. Three things you can tune:
   python MessagePing.py my-account COM6 --dest !435c4ce4
   ```
 - **Timing.** To see where the time goes, add `--timing` to the gateway command.
-  It prints when each packet was sent and acknowledged, and the endpoint sends back
-  when each one arrived; the gateway then prints the two side by side. The endpoint's
-  live feed shows arrival times to the millisecond.
+  It prints when each packet was sent (and acknowledged, where it waited for one),
+  and the endpoint sends back when each one arrived; the gateway then prints the two
+  side by side. Read the gap columns rather than `tx->rx`, which is only meaningful
+  if both machines' clocks agree. The endpoint's live feed shows arrival times to
+  the millisecond.
 - **Email size.** An email is capped at 6 packets (`MeshCodec.MAX_CHUNKS`); a longer
   body is trimmed and ends in `…`.
 

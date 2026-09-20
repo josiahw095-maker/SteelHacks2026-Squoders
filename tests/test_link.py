@@ -76,18 +76,18 @@ class AckLink(FakeLink):
 
 
 class Pacing(unittest.TestCase):
-    """Fix 1: a 5 s pause between packets unless the link says otherwise."""
+    """Fix 1: a 2 s pause between packets unless the link says otherwise."""
 
     def send(self, link, **kwargs):
         with mock.patch.object(MeshSend.time, "sleep") as sleep:
             quiet(MeshSend.send_packets, link, packets(), **kwargs)
         return [c.args[0] for c in sleep.call_args_list]
 
-    def test_default_is_five_seconds(self):
-        self.assertEqual(MeshSend.SEND_GAP_SECONDS, 5.0)
+    def test_default_is_two_seconds(self):
+        self.assertEqual(MeshSend.SEND_GAP_SECONDS, 2.0)
         pauses = self.send(FakeLink())
         self.assertGreaterEqual(len(pauses), 2)
-        self.assertTrue(all(p == 5.0 for p in pauses), pauses)
+        self.assertTrue(all(p == 2.0 for p in pauses), pauses)
 
     def test_pauses_are_between_packets_not_after_the_last(self):
         link = FakeLink()
@@ -118,7 +118,7 @@ class Pacing(unittest.TestCase):
         with mock.patch.object(MeshSend.time, "sleep") as sleep:
             sent = quiet(MeshSend.resend, link, group, {0, 1, 2})
         self.assertEqual(sent, 3)
-        self.assertTrue(all(c.args[0] == 5.0 for c in sleep.call_args_list))
+        self.assertTrue(all(c.args[0] == 2.0 for c in sleep.call_args_list))
 
 
 from types import SimpleNamespace
@@ -169,8 +169,11 @@ class PresetPacing(unittest.TestCase):
             quiet(MeshSend.send_packets, link, packets(), gap = None)
         return sum(c.args[0] for c in sleep.call_args_list), sleep.call_count
 
-    def test_long_fast_still_paces_at_about_five_seconds(self):
-        self.assertTrue(4.5 <= MeshSend.pace(radio_link("LONG_FAST")) <= 5.5)
+    def test_long_fast_paces_just_past_one_airtime(self):
+        link = radio_link("LONG_FAST")
+        gap = MeshSend.pace(link)
+        self.assertTrue(2.0 <= gap <= 2.5, gap)
+        self.assertGreater(gap, MeshSend.packet_airtime(link))      # the packet is off the air first
 
     def test_short_fast_paces_far_faster(self):
         gap = MeshSend.pace(radio_link("SHORT_FAST"))
@@ -189,7 +192,9 @@ class PresetPacing(unittest.TestCase):
     def test_a_15_packet_email_sends_much_sooner_on_a_fast_preset(self):
         long_fast = MeshSend.pace(radio_link("LONG_FAST")) * 14
         short_fast = MeshSend.pace(radio_link("SHORT_FAST")) * 14
-        self.assertGreater(long_fast / short_fast, 8)
+        # SHORT_FAST's own airtime is under MIN_GAP, so the floor, not the
+        # airtime, is what sets its pace; the ratio stops widening there.
+        self.assertGreater(long_fast / short_fast, 6)
 
     def test_the_gap_used_is_the_gap_for_that_radio(self):
         wait, pauses = self.total_wait(radio_link("SHORT_FAST"))

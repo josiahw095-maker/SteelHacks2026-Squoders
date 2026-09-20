@@ -99,8 +99,13 @@ class SenderLog(unittest.TestCase):
     tearDown = setUp
 
     def send(self, link, pk = None, **kwargs):
+        """A confirmed send, with ACK_TRAIN_LIMIT lifted so several packets go
+        down the ack path. Real sends only wait for a single packet; what the
+        limit is for is pinned in test_ack.TheTrainLimit."""
         pk = pk or packets()
-        result, out = capture(MeshSend.send_packets, link, pk, dest = PEER, wait_ack = True, **kwargs)
+        with mock.patch.object(MeshSend, "ACK_TRAIN_LIMIT", 99):
+            result, out = capture(MeshSend.send_packets, link, pk, dest = PEER,
+                                  wait_ack = True, **kwargs)
         return result, out, pk
 
     def test_the_time_format_is_hours_minutes_seconds_and_milliseconds(self):
@@ -409,15 +414,18 @@ class RoundTrip(unittest.TestCase):
         MockRadio.SPOOL, MockRadio.DOWN, MockRadio.UP = self.saved
         shutil.rmtree(self.tmp, ignore_errors = True)
 
-    def test_a_timed_email_comes_back_as_a_table_with_a_row_per_packet(self):
+    def round_trip(self, acked):
+        """Send a timed email, let the endpoint report, and print the table."""
         import MessageReply
         from station import Station
         gateway, endpoint = MockRadio.LoopbackInterface("down"), Station(port = "loopback")
 
         pk = MeshCodec.to_packets(email(True))
-        sent, sender_log = capture(MeshSend.send_packets, gateway, pk, dest = PEER, wait_ack = True)
+        limit = 99 if acked else MeshSend.ACK_TRAIN_LIMIT
+        with mock.patch.object(MeshSend, "ACK_TRAIN_LIMIT", limit):
+            sent, sender_log = capture(MeshSend.send_packets, gateway, pk,
+                                       dest = PEER, wait_ack = True)
         self.assertEqual(sent, len(pk))
-        self.assertEqual(len(re.findall(r"^\s+acked ", sender_log, re.M)), len(pk))
 
         endpoint.Poll()
         self.assertEqual(len(endpoint.Inbox()), 1)
@@ -429,10 +437,27 @@ class RoundTrip(unittest.TestCase):
         reports = MessageReply.Drain()
         self.assertEqual(len(reports), 1)
         summary, table = capture(MessageReply.Deliver, None, "zz-timing", reports[0], False, gateway)
+        return pk, sender_log, summary, table
+
+    def test_a_timed_email_comes_back_as_a_table_with_a_row_per_packet(self):
+        """The real path: an email is longer than ACK_TRAIN_LIMIT, so it is
+        paced, not acked. The table still lines up every packet's send time
+        with when the endpoint got it - which is the point of the report."""
+        pk, sender_log, summary, table = self.round_trip(acked = False)
+        self.assertEqual(len(re.findall(r"^\s+sent ", sender_log, re.M)), len(pk))
+        self.assertEqual(len(re.findall(r"^\s+acked ", sender_log, re.M)), 0)
 
         rows = [l for l in table.splitlines() if re.match(r"\s+\d+\s+\d\d:", l)]
         self.assertEqual(len(rows), len(pk))
         self.assertEqual((summary["parts_reported"], summary["parts_sent"]), (len(pk), len(pk)))
+        self.assertIsNone(summary["ack_wait_avg"])        # nothing waited for, nothing to average
+        self.assertIsNotNone(summary["rx_gap_max"])       # the gaps still tell us what the link did
+
+    def test_when_packets_are_acked_the_table_carries_the_ack_times_too(self):
+        pk, sender_log, summary, table = self.round_trip(acked = True)
+        self.assertEqual(len(re.findall(r"^\s+acked ", sender_log, re.M)), len(pk))
+        rows = [l for l in table.splitlines() if re.match(r"\s+\d+\s+\d\d:", l)]
+        self.assertEqual(len(rows), len(pk))
         self.assertIsNotNone(summary["ack_wait_avg"])
 
 

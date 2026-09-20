@@ -15,11 +15,13 @@ import time
 from collections import OrderedDict
 
 # Pause between packets when we cannot tell how fast the radio is. Sized for
-# LONG_FAST, where one 200-byte packet is about 1.9 s on the air and the
-# receiver's rebroadcast takes about as long again. At 2 s the next packet was
-# queued while the last was still going out, and packets went missing; every
-# hardware test at 5 s delivered everything.
-SEND_GAP_SECONDS = 5.0
+# LONG_FAST, where one 200-byte packet is about 1.9 s on the air.
+#
+# This was briefly raised to 5 s to cure packets going missing. It did not:
+# the 2026-09-20 hardware run lost 4 of 6 packets at a 6 s spacing. The loss
+# was the firmware retransmitting broadcasts (see _transmit), not our pacing,
+# and the wider gap only made every message two to three times slower.
+SEND_GAP_SECONDS = 2.0
 
 
 # The size the codec fills packets to (MeshCodec.MAX_PAYLOAD).
@@ -28,9 +30,10 @@ PACKET_BYTES = 200
 # Meshtastic wraps our payload in a 16-byte mesh header plus a little protobuf.
 FRAME_OVERHEAD = 22
 
-# Pause = this many packet-airtimes. Measured, not derived: 5 s at LONG_FAST
-# (1.9 s airtime, so 2.6x) delivered everything, and about 1x did not.
-GAP_AIRTIMES = 2.6
+# Pause = this many packet-airtimes, so a fast preset is not held back by a
+# gap sized for a slow one. Just over 1x: the packet is off the air before the
+# next is queued, which is all the spacing has to achieve.
+GAP_AIRTIMES = 1.1
 MIN_GAP = 0.3
 
 # (spread factor, bandwidth in Hz, coding-rate denominator) for each preset,
@@ -268,13 +271,20 @@ def pick_dest(link, explicit = None, now = None):
 def _transmit(link, packet, dest, **extra):
     """One sendData call, addressed to dest or broadcast.
 
+    Only an addressed packet asks for an ack. A broadcast has nobody to
+    acknowledge it, and wantAck on one makes the firmware retransmit it up to
+    three more times while it listens for a rebroadcast that settles nothing.
+    At LONG_FAST that is four 1.9 s transmissions where we intended one, so
+    the channel is busier than our spacing assumes and packets collide. Losing
+    a broadcast is what the resend request exists to repair.
+
     The library calls sys.exit() on some bad input; that becomes an ordinary
     error here so a bad packet cannot end the whole program.
     """
     try:
         if dest:
             return link.sendData(packet, destinationId = dest, wantAck = True, **extra)
-        return link.sendData(packet, wantAck = True, **extra)
+        return link.sendData(packet, **extra)
     except SystemExit as error:
         raise RuntimeError(f"the radio refused the packet ({error})") from None
 
@@ -286,17 +296,29 @@ def _transmit(link, packet, dest, **extra):
 # time means the next packet goes out the moment the channel is free, and a
 # dead link is noticed within seconds rather than after the whole email.
 
-# How long to wait for an ack, in packet-airtimes. Generous: the firmware
-# retries a lost packet itself before it gives up, and that takes a few of them.
-ACK_AIRTIMES = 10
+# How long to wait for an ack, in packet-airtimes. On the 2026-09-20 run the
+# acks that arrived took 5.4 to 6.5 s at LONG_FAST, against 1.9 s of airtime,
+# so 4x covers a healthy ack with room to spare. This was 10x (19 s), and
+# every lost ack then cost 38 s of silence across two tries - long enough that
+# the endpoint gave up waiting and asked again mid-resend.
+ACK_AIRTIMES = 4
 MIN_ACK_WAIT = 4.0
-UNKNOWN_ACK_WAIT = 20.0
+UNKNOWN_ACK_WAIT = 12.0
 
 # Attempts per packet of our own, on top of the firmware's retries.
 ACK_TRIES = 2
 
 # The pause after an ack before the next packet. The channel is already free.
 ACK_GAP = 0.2
+
+# Waiting for an ack is only worth it for a send this short. Per packet it
+# costs a round trip when it works and a timeout when it does not, and those
+# add up down a train: on 2026-09-20 a four-packet resend that should have
+# taken 8 s took 44 s, and the endpoint gave up waiting and asked again while
+# it was still running, which started the whole thing over. A longer send is
+# paced instead and repaired by the resend request, which is what it is for.
+# A single packet has no train to hold up, so there it is pure gain.
+ACK_TRAIN_LIMIT = 1
 
 
 def ack_timeout(link):
@@ -382,10 +404,12 @@ def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None
     that node is addressed. A link of None prints instead of transmitting, so
     the whole pipeline can be exercised without hardware.
 
-    wait_ack sends each packet only after the previous one was acknowledged,
+    wait_ack asks for each packet to be acknowledged before the next goes out,
     and gives up on the rest if one cannot be delivered. It needs a dest,
-    because a broadcast has nobody to acknowledge it. Otherwise packets are
-    spaced by gap, which None sets to whatever suits the link (see pace()).
+    because a broadcast has nobody to acknowledge it, and it applies only up
+    to ACK_TRAIN_LIMIT packets; a longer send ignores it and is paced instead.
+    Packets not waited for are spaced by gap, which None sets to whatever
+    suits the link (see pace()).
 
     Every packet's send time is printed, and in ack mode its ack time too. The
     record is kept (see timeline_for) for comparing with the far end's report.
@@ -394,7 +418,8 @@ def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None
     """
     if dest:
         dest = normalize_dest(dest)
-    confirm = bool(wait_ack and dest and link is not None)
+    confirm = bool(wait_ack and dest and link is not None
+                   and len(packets) <= ACK_TRAIN_LIMIT)
     if gap is None:
         gap = 0 if link is None else (ACK_GAP if confirm else pace(link))
 

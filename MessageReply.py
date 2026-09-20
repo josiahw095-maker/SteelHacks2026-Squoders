@@ -29,6 +29,19 @@ GROUP_TIMEOUT = 300
 _groups = {}
 _groups_lock = threading.Lock()
 
+# A repeat of a request we already served this recently is ignored. The
+# endpoint asks again when a message has been quiet for a while, and its timer
+# can run out while our resend is still on the air - on 2026-09-20 that made
+# the gateway send the same four parts twice, 82 s of airtime that delivered
+# nothing. Serving the first request is the answer to both.
+#
+# This has to cover one resend on the air (about 13 s for a full six parts at
+# LONG_FAST) and no more. If the resend is genuinely lost the endpoint asks
+# again, and by then its backoff has pushed the second ask well past this, so
+# the repeat that matters is still served.
+RESEND_DEBOUNCE = 20
+_resent = {}
+
 # Finished replies waiting for the poll loop. Queue is already thread-safe.
 _replies = []
 _replies_lock = threading.Lock()
@@ -195,6 +208,15 @@ def Resend(link, message):
     if link is None:
         print(f"  [dry-run] would resend parts {wanted} of 0x{message['thread']:04x}")
         return None
+
+    now = time.time()
+    key = (message["thread"], tuple(wanted))
+    for stale in [k for k, when in _resent.items() if now - when > RESEND_DEBOUNCE]:
+        del _resent[stale]
+    if key in _resent:
+        print(f"  already resending parts {wanted} of 0x{message['thread']:04x}; ignoring the repeat")
+        return 0
+    _resent[key] = now
 
     dest = pick_dest(link)
     count = resend(link, message["thread"], wanted, dest = dest, wait_ack = bool(dest))

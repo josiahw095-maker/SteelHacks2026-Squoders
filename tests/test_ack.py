@@ -22,7 +22,15 @@ PEER = "!aabbccdd"
 
 
 def send(link, pk = None, **kwargs):
-    return quiet(MeshSend.send_packets, link, pk or packets(), dest = PEER, wait_ack = True, **kwargs)
+    """A confirmed send.
+
+    ACK_TRAIN_LIMIT is lifted so the ack path can be exercised over several
+    packets. The limit itself is what TheTrainLimit below pins; in real use it
+    keeps this path off anything longer than a single packet.
+    """
+    with mock.patch.object(MeshSend, "ACK_TRAIN_LIMIT", 99):
+        return quiet(MeshSend.send_packets, link, pk or packets(), dest = PEER,
+                     wait_ack = True, **kwargs)
 
 
 class WaitingForAcks(unittest.TestCase):
@@ -60,7 +68,7 @@ class WaitingForAcks(unittest.TestCase):
         took = time.monotonic() - start
         fixed = (len(pk) - 1) * MeshSend.SEND_GAP_SECONDS
         self.assertLess(took, 1.0)
-        self.assertGreater(fixed / took, 10, f"ack-paced {took:.2f}s vs fixed-gap {fixed:.0f}s")
+        self.assertGreater(fixed / took, 5, f"ack-paced {took:.2f}s vs fixed-gap {fixed:.0f}s")
 
     def test_the_pause_after_an_ack_is_tiny(self):
         with mock.patch.object(MeshSend.time, "sleep") as sleep:
@@ -132,10 +140,61 @@ class WhenPacketsFail(unittest.TestCase):
         import io
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            MeshSend.send_packets(AckLink(script = lambda n: "MAX_RETRANSMIT"), packets(),
+            MeshSend.send_packets(AckLink(script = lambda n: "MAX_RETRANSMIT"), packets()[:1],
                                   dest = PEER, wait_ack = True)
         self.assertIn("FAILED", out.getvalue())
         self.assertIn("MAX_RETRANSMIT", out.getvalue())
+
+
+class TheTrainLimit(unittest.TestCase):
+    """Waiting per packet is only affordable for a single packet.
+
+    On 2026-09-20 a four-packet resend waited for an ack on each one. Three of
+    eleven attempts got none, each costing a full timeout, and the resend took
+    44 s and then 82 s instead of about 8 s. The endpoint's patience ran out
+    mid-resend and it asked again, so the gateway resent parts it had already
+    delivered. These pin the rule that stops that happening again.
+    """
+
+    def setUp(self):
+        MeshSend.forget_peer()
+        MeshSend.default_dest = None
+
+    tearDown = setUp
+
+    def test_one_packet_still_waits_for_its_ack(self):
+        link = AckLink()
+        quiet(MeshSend.send_packets, link, packets()[:1], dest = PEER, wait_ack = True)
+        self.assertTrue(callable(link.calls[0]["onResponse"]))
+
+    def test_a_train_of_packets_does_not(self):
+        link = AckLink()
+        pk = packets()
+        self.assertGreater(len(pk), MeshSend.ACK_TRAIN_LIMIT)
+        with mock.patch.object(MeshSend.time, "sleep"):
+            quiet(MeshSend.send_packets, link, pk, dest = PEER, wait_ack = True)
+        self.assertEqual(len(link.calls), len(pk))
+        self.assertTrue(all(c.get("onResponse") is None for c in link.calls))
+
+    def test_a_silent_link_cannot_stall_a_resend(self):
+        """The failure mode itself: every ack lost, yet the resend stays quick."""
+        pk = packets()
+        MeshSend.remember_sent(pk)
+        group = int.from_bytes(pk[0][:2], "big")
+        link = AckLink(script = lambda n: "SILENT")
+        start = time.monotonic()
+        with mock.patch.object(MeshSend.time, "sleep"):          # pacing only; no ack waits
+            sent = quiet(MeshSend.resend, link, group, {0, 1, 2}, dest = PEER, wait_ack = True)
+        self.assertEqual(sent, 3)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_the_limit_keeps_a_whole_email_inside_the_endpoints_patience(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "endpoint"))
+        import station
+        import MeshCodec
+        gap = MeshSend.pace(radio_link("LONG_FAST"))
+        self.assertLess(MeshCodec.MAX_CHUNKS * gap, station.REQUEST_AFTER)
 
 
 class WhenAcksDoNotApply(unittest.TestCase):
@@ -162,8 +221,23 @@ class Timeouts(unittest.TestCase):
     def test_a_slow_radio_is_given_longer_than_a_fast_one(self):
         slow = MeshSend.ack_timeout(radio_link("LONG_FAST"))
         fast = MeshSend.ack_timeout(radio_link("SHORT_FAST"))
-        self.assertTrue(15 < slow < 25, slow)
+        self.assertTrue(6 < slow < 10, slow)
         self.assertEqual(fast, MeshSend.MIN_ACK_WAIT)
+
+    def test_the_wait_covers_a_healthy_ack_without_stalling_on_a_lost_one(self):
+        """The 2026-09-20 run: acks that came back took 5.4 to 6.5 s at LONG_FAST.
+
+        The wait has to clear those, or a packet about to be acked is sent
+        twice. It also has to stay short enough that a whole packet's worth of
+        tries fits inside the endpoint's patience, or the endpoint asks again
+        while we are still resending - which is exactly what went wrong.
+        """
+        import sys
+        sys.path.insert(0, str(ROOT / "endpoint"))
+        import station
+        wait = MeshSend.ack_timeout(radio_link("LONG_FAST"))
+        self.assertGreater(wait, 6.5)
+        self.assertLess(wait * MeshSend.ACK_TRIES, station.REQUEST_AFTER)
 
     def test_an_unreadable_radio_gets_the_cautious_default(self):
         self.assertEqual(MeshSend.ack_timeout(FakeLink()), MeshSend.UNKNOWN_ACK_WAIT)
