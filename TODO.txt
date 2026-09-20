@@ -2,3 +2,7 @@ TODO - SteelHacks2026-Squoders
 ==============================
 
 - Make sure Devices can communicate specifically using device IDs (By harcoded Doc or Dynamic)
+
+- Automatically detect USB Port (COM5 vs. COM6 vs. other)
+
+-Get Bluetooth (Need App First)
