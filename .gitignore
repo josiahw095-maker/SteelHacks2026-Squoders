@@ -233,3 +233,12 @@ tokens/
 
 # Mock radio packet spool - transient, never commit
 spool/
+
+# Android Studio / IntelliJ project state. Regenerated per machine, so
+# committing it only produces churn and conflicts between us.
+.idea/
+*.iml
+.gradle/
+MyApplication/build/
+MyApplication/local.properties
+MyApplication/app/build/
