@@ -68,9 +68,15 @@ MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
 MAX_ADDRESS = 100   # bytes; a recipient address is never shortened
 HEADER = 3          # bytes of chunk header (id + part/total)
-MAX_PARTS = 15      # part and total share one byte, 4 bits each
-MAX_CHUNKS = MAX_PARTS  # trim the body only when it will not fit even in a
-                        # full set of packets, which is the header's limit
+MAX_PARTS = 15      # part and total share one byte, 4 bits each: the header's hard limit
+MAX_CHUNKS = 6      # the body is trimmed until the email fits in this many packets.
+                    # Each packet is ~2 s on the air at LONG_FAST plus the pause
+                    # between them, so 6 is about 15 s (with acks) and 15 would
+                    # hold the radio for over a minute.
+MAX_EXPANSION = 50  # text this much larger than the budget is cut before it is
+                    # even compressed, so a huge email costs milliseconds, not
+                    # seconds. Ordinary text shrinks 2-3x; only pathological
+                    # repetition beats 50x, and that is what this still allows.
 RECORD_HEAD = 6     # bytes of record header (4 time + 2 thread)
 ELLIPSIS = "…"  # 3 bytes in UTF-8, marks text that was cut
 
@@ -217,14 +223,33 @@ def pack(sender, subject, minutes, thread, body, flags):
 
 def encode(sender, subject, minutes, thread, body, flags):
     """Pack, trimming the body (marked with an ellipsis) until the result fits
-    in MAX_CHUNKS packets. Trimming happens on the text, before compression."""
+    in MAX_CHUNKS packets. Trimming happens on the text, before compression.
+
+    When it does not fit, the longest body that does is found by bisection, so
+    an email only just over the limit loses only what it must. (Shaving 10% at
+    a time threw away up to a tenth of the text, about 400 bytes, for nothing.)
+    """
     limit = MAX_CHUNKS * (MAX_PAYLOAD - HEADER)
-    while True:
-        data = pack(sender, subject, minutes, thread, body, flags)
-        if len(data) <= limit or not body:
-            return data
+
+    size = len(body.encode())
+    if size > limit * MAX_EXPANSION:
+        body = shorten(body, limit * MAX_EXPANSION)
         size = len(body.encode())
-        body = shorten(body, size * 9 // 10) if size > 12 else ""
+
+    data = pack(sender, subject, minutes, thread, body, flags)
+    if len(data) <= limit or not body:
+        return data
+
+    best, low, high = pack(sender, subject, minutes, thread, "", flags), 0, size
+    while high - low > 1:                          # low fits, high does not
+        middle = (low + high) // 2
+        kept = shorten(body, middle) if middle > len(ELLIPSIS.encode()) else ""
+        candidate = pack(sender, subject, minutes, thread, kept, flags)
+        if len(candidate) <= limit:
+            low, best = middle, candidate
+        else:
+            high = middle
+    return best
 
 
 def chunk(group_id, data):

@@ -115,6 +115,31 @@ python -m streamlit run endpoint/app.py            # endpoint machine, port COM5
 The endpoint prints its node id on connect. Both nodes must share a region
 and a channel, or they will not hear each other.
 
+### Speed and reliability
+
+Packets are paced to the radio's real airtime, addressed to one node, and each
+is acknowledged before the next goes out. Three things you can tune:
+
+- **Preset.** The default, LONG_FAST, is about 1 kbps: one packet is ~2 s on the
+  air. SHORT_FAST is roughly ten times quicker and plenty across a room. Both
+  nodes must match. This leaves the channel key alone:
+
+  ```
+  python set_preset.py SHORT_FAST COM5 COM6
+  ```
+
+  (`provision.py ... --preset SHORT_FAST` does the same while making a new key.)
+- **Destination.** The gateway sends to the peer it last heard from. To pin it,
+  use `--dest` or set `MESH_DEST`; the endpoint prints its node id on connect:
+
+  ```
+  python MessagePing.py my-account COM6 --dest !435c4ce4
+  ```
+- **Email size.** An email is capped at 6 packets (`MeshCodec.MAX_CHUNKS`); a longer
+  body is trimmed and ends in `…`.
+
+Run the unit tests (no radio needed) with `python -m unittest discover -s tests -v`.
+
 ### 6. Connect Gmail
 
 1. In [Google Cloud Console](https://console.cloud.google.com/) create a project, enable the **Gmail API**, configure the OAuth consent screen and add your account as a test user.

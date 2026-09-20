@@ -51,6 +51,9 @@ class LoopbackInterface:
     the endpoint sends "up".
     """
 
+    # A folder needs no airtime, so senders may skip the pause between packets.
+    gap_hint = 0.05
+
     def __init__(self, direction = "down", node_id = "!loopback"):
         self.direction = direction
         self.node_id = node_id
@@ -64,9 +67,12 @@ class LoopbackInterface:
 
     # --- the bits MeshSend and Station call ------------------------------
 
-    def sendData(self, packet, destinationId = None, wantAck = False, **kwargs):
+    def sendData(self, packet, destinationId = None, wantAck = False, onResponse = None, **kwargs):
         name = "%.6f-%06d-%d.pkt" % (time.time(), next(_counter), len(packet))
         (self.send_box / name).write_bytes(bytes(packet))
+        if onResponse is not None:
+            # A folder never loses a packet, so it acknowledges at once.
+            onResponse({"decoded": {"routing": {"errorReason": "NONE"}}})
         return None
 
     def getMyNodeInfo(self):

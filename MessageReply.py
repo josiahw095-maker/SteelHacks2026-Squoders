@@ -73,8 +73,11 @@ def OnReceive(packet, interface = None):
     if decoded.get("portnum") != "PRIVATE_APP":
         return
     payload = decoded.get("payload")
-    if payload:
-        Collect(payload)
+    if payload and Collect(payload) is not None:
+        # A whole valid message from the endpoint: now we know who it is, so
+        # our packets can go to it directly instead of to everyone.
+        from MeshSend import note_peer
+        note_peer(packet.get("fromId"))
 
 
 def Listen():
@@ -184,7 +187,7 @@ def SendNew(service, message, dry_run = False):
 def Resend(link, message):
     """Put back on the air the parts a receiver says it never got."""
     from MeshCodec import wanted_parts
-    from MeshSend import resend
+    from MeshSend import resend, pick_dest
 
     wanted = wanted_parts(message)
     if not wanted:
@@ -193,7 +196,8 @@ def Resend(link, message):
         print(f"  [dry-run] would resend parts {wanted} of 0x{message['thread']:04x}")
         return None
 
-    count = resend(link, message["thread"], wanted)
+    dest = pick_dest(link)
+    count = resend(link, message["thread"], wanted, dest = dest, wait_ack = bool(dest))
     if count:
         print(f"  resent {count} packet(s) of 0x{message['thread']:04x}")
     else:

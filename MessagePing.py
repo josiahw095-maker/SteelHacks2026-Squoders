@@ -3,12 +3,16 @@
     python MessagePing.py <account> --dry-run     print packets, do not transmit
     python MessagePing.py <account> COM6          send over USB serial
     python MessagePing.py <account>               send over Bluetooth
+    ... add  --dest !435c4ce4  (or set MESH_DEST) to address one node directly
+
+Without --dest the gateway addresses the peer it last heard from, or the only
+other node it has heard lately, and broadcasts only if it knows neither.
 
 The last processed historyId is saved next to the account token, so mail that
 arrives while this is not running is still delivered on the next start.
 """
 
-import json
+import os
 import random
 import sys
 import threading
@@ -25,13 +29,30 @@ from MessageTransform import transform
 from MeshCodec import to_packets, short_hash
 from SentLog import Remember
 from MessageReply import Listen, Drain, Expire, Deliver, Collect
-from MeshSend import open_link, send_packets
+import MeshSend
+from MeshSend import open_link, send_packets, pick_dest, normalize_dest
 
 POLL_SECONDS = 2
 
 # Gmail statuses worth retrying rather than crashing on.
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_BACKOFF = 60
+
+
+def SplitArgs(argv, environ = None):
+    """(positional arguments, pinned destination or None) from the command line.
+
+    --dest may appear anywhere; MESH_DEST in the environment is the fallback.
+    """
+    environ = os.environ if environ is None else environ
+    args, dest = list(argv), None
+    if "--dest" in args:
+        at = args.index("--dest")
+        if at + 1 >= len(args):
+            raise ValueError("--dest needs a node id, e.g. --dest !435c4ce4")
+        dest = args[at + 1]
+        del args[at:at + 2]
+    return args, dest or environ.get("MESH_DEST") or None
 
 
 def CheckPingRecieved(service, history_id):
@@ -114,11 +135,18 @@ def CurrentHistoryId(service):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("usage: python MessagePing.py <account-name> [--dry-run | <port-or-ble-address>]")
+    try:
+        args, pinned = SplitArgs(sys.argv[1:])
+        if pinned:
+            MeshSend.default_dest = normalize_dest(pinned)
+    except ValueError as error:
+        print(error)
         sys.exit(1)
-    account = sys.argv[1]
-    target = sys.argv[2] if len(sys.argv) > 2 else None
+    if len(args) < 1:
+        print("usage: python MessagePing.py <account-name> [--dry-run | <port-or-ble-address>] [--dest !nodeid]")
+        sys.exit(1)
+    account = args[0]
+    target = args[1] if len(args) > 1 else None
 
     creds = get_credentials(
         str(GMAIL_DIR / "tokens" / f"{account}.json"),
@@ -168,7 +196,11 @@ if __name__ == "__main__":
                 packets = to_packets(email)
                 print("")
                 print(f"{email['sender']}: {email['subject']}  ->  {len(packets)} packet(s)")
-                send_packets(link, packets)
+                dest = pick_dest(link) if link else None
+                sent = send_packets(link, packets, dest = dest, wait_ack = bool(dest))
+                if sent < len(packets):
+                    print(f"  only {sent} of {len(packets)} packets were confirmed; "
+                          "the endpoint will ask for the rest")
                 # so a reply carrying this thread hash can be threaded back
                 Remember(account, short_hash(email["thread"] or email["id"]), email)
 

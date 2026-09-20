@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import MeshCodec
+import MeshSend
 
 # A half-received message is forgotten after this long.
 GROUP_TIMEOUT = 300
@@ -36,6 +37,10 @@ DONE_WINDOW = 45
 MAX_DONE = 60
 
 
+class SendFailed(RuntimeError):
+    """Some packets were never acknowledged, so the message did not get through."""
+
+
 class Station:
     """One connection to the end node, plus everything heard so far."""
 
@@ -51,6 +56,7 @@ class Station:
         self.link = None
         self.node_id = None
         self.error = None
+        self.peer = None            # the gateway's node id, once one of its emails has arrived
 
         if not mock:
             self.Connect()
@@ -90,10 +96,13 @@ class Station:
             return
         payload = decoded.get("payload")
         if payload:
-            self.Accept(payload)
+            self.Accept(payload, source = packet.get("fromId"))
 
-    def Accept(self, payload):
+    def Accept(self, payload, source = None):
         """Feed one packet in. Returns the message if that completed one.
+
+        source is the node id it came from. A complete email from a node tells
+        us who the gateway is, so replies can go to it directly.
 
         Separate from OnReceive so the endpoint can be driven with bytes in
         tests, with no radio anywhere.
@@ -136,6 +145,12 @@ class Station:
             return None                      # our own send heard back
 
         self.Note("mail", f"decoded: {message['subject'] or '(no subject)'}", air_bytes)
+        if source:
+            try:
+                self.peer = MeshSend.normalize_dest(source)
+            except ValueError:
+                pass
+
         message["at"] = time.time()
         message["packets"] = packet_count
         message["airbytes"] = air_bytes
@@ -226,7 +241,10 @@ class Station:
 
         for group_id, missing in asks:
             self.Note("ask", f"asked for parts {missing} of {group_id:04x}")
-            self.Send(MeshCodec.request_packets(group_id, missing))
+            try:
+                self.Send(MeshCodec.request_packets(group_id, missing))
+            except SendFailed:
+                pass                         # noted already; the next pass asks again
         return asks
 
     def Expire(self, now = None):
@@ -273,31 +291,41 @@ class Station:
 
     # --- what the UI writes ------------------------------------------------
 
-    def Send(self, packets, gap = 2.0, on_progress = None):
+    def Send(self, packets, gap = None, on_progress = None):
         """Put packets on the air, pausing between them for airtime.
 
+        Goes to the gateway directly once we know who it is, and to the whole
+        channel until then. gap of None paces to the radio's real speed.
         on_progress(sent, total) is called after each packet so a caller can
-        show how far along the send is; a full packet is seconds of airtime,
-        which is long enough to be worth showing.
+        show how far along the send is.
         """
         total = len(packets)
 
-        def report(sent):
+        def report(sent, of):
             if on_progress:
-                on_progress(sent, total)
+                on_progress(sent, of)
 
         if self.link is None:
             for position in range(total):     # demo mode: pretend, but pace it
                 time.sleep(0.2)
-                report(position + 1)
+                report(position + 1, total)
             return total
 
-        for position, packet in enumerate(packets):
-            self.link.sendData(packet, wantAck = True)
-            self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
-            report(position + 1)
-            if position < total - 1:
-                time.sleep(gap)
+        dest = self.peer
+
+        def sent(position, of):
+            self.Note("tx", f"packet out ({position}/{of})" + (f" to {dest}" if dest else ""),
+                      len(packets[position - 1]))
+            report(position, of)
+
+        confirmed = MeshSend.send_packets(self.link, packets, dest = dest, gap = gap,
+                                          remember = False, on_sent = sent,
+                                          wait_ack = bool(dest))
+        if confirmed < total:
+            self.peer = None                 # stop addressing a node that is not answering
+            self.Note("ask", f"only {confirmed} of {total} packets were acknowledged")
+            raise SendFailed(f"only {confirmed} of {total} packets were acknowledged "
+                             "- the other end did not answer")
         return total
 
     def Reply(self, thread, body, on_progress = None):
