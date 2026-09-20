@@ -3,9 +3,8 @@
     python RadioTestListen.py COM5
 
 Prints its own node id (give that to RadioTestSend.py), then waits for packets and
-prints the decoded email. Understands both formats: PRIVATE_APP binary packets
-(MeshCodec, sent by RadioTestSend.py) and text packets (MessagePayload, sent by
-MessagePing.py).
+prints the decoded email or reply. Understands PRIVATE_APP binary packets
+(MeshCodec), which is what RadioTestSend.py and MessagePing.py send.
 """
 import sys
 import time
@@ -15,42 +14,12 @@ from meshtastic.protobuf import config_pb2
 from pubsub import pub
 
 import MeshCodec
-import MessagePayload
 
 groups = {}   # 2-byte email id -> packets received so far
 
 
-text_groups = {}   # (kind, id) -> text packets received so far
-
-
-def OnText(packet, decoded):
-    """Text messages: MessagePing.py sends these (MessagePayload's format)."""
-    text = decoded["payload"].decode("utf-8", errors="replace")
-    try:
-        fields = MessagePayload.parse_packet(text)
-    except ValueError:
-        print(f"text from {packet.get('fromId')}: {text!r}   (not our format)")
-        return
-    print(f"text packet from {packet.get('fromId')}: {len(text.encode())} bytes, "
-          f"part {fields['index'] + 1}/{fields['total']}")
-
-    key = (fields["kind"], fields["id"])
-    group = text_groups.setdefault(key, [])
-    group.append(text)
-    message = MessagePayload.reassemble(group)
-    if not message["complete"]:
-        print(f"  waiting for parts {[i + 1 for i in message['missing']]}...")
-        return
-    del text_groups[key]
-    print(f"\nEMAIL  from={message['sender']!r}  subject={message['subject']!r}  "
-          f"reply={message['reply']}\n{message['body']}\n")
-
-
 def OnReceive(packet, interface=None):
     decoded = packet.get("decoded", {})
-    if decoded.get("portnum") == "TEXT_MESSAGE_APP":
-        OnText(packet, decoded)
-        return
     if decoded.get("portnum") != "PRIVATE_APP":
         print(f"other packet from {packet.get('fromId')}: {decoded.get('portnum')}")
         return
