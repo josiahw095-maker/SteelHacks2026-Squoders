@@ -24,7 +24,7 @@ from googleapiclient.errors import HttpError
 from MessageTransform import transform
 from MeshCodec import to_packets, short_hash
 from SentLog import Remember
-from MessageReply import Listen, Drain, Expire, Deliver
+from MessageReply import Listen, Drain, Expire, Deliver, Collect
 from MeshSend import open_link, send_packets
 
 POLL_SECONDS = 2
@@ -131,7 +131,8 @@ if __name__ == "__main__":
         print("Dry run: packets will be printed, not transmitted.")
     else:
         link = open_link(target)
-        Listen()
+        if not hasattr(link, "Receive"):
+            Listen()
         print("Connected to the gateway node. Listening for replies.")
 
     history_id = LoadHistoryId(account)
@@ -177,6 +178,12 @@ if __name__ == "__main__":
 
             # Replies arrive on the radio thread; this is where they are acted
             # on. In dry-run nothing is transmitted, so nothing is sent either.
+            # With the mock radio there is no pubsub callback, so the
+            # gateway has to pull packets out of the spool itself.
+            if hasattr(link, "Receive"):
+                for payload in link.Receive():
+                    Collect(payload)
+
             Expire()
             for reply in Drain():
                 print("")

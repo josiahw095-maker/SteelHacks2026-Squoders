@@ -26,6 +26,11 @@ def open_link(target=None):
     A COM port or /dev path opens over USB serial, which is what the hardware
     tests use; anything else is treated as a Bluetooth name or address.
     """
+    from MockRadio import IsLoopback, LoopbackInterface
+    if IsLoopback(target):
+        # No radio at all: packets go through a folder. See MockRadio.py.
+        return LoopbackInterface(direction = "down")
+
     if target and (target.upper().startswith("COM") or target.startswith("/dev/")):
         import meshtastic.serial_interface
         return meshtastic.serial_interface.SerialInterface(target)

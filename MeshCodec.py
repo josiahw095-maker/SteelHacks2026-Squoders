@@ -250,13 +250,15 @@ def to_packets(email):
 def reply_packets(thread_id, body, message_id=""):
     """A reply heading endpoint -> gateway, in the same format.
 
-    Sender and subject are left empty: the gateway looks the original message
-    up by thread and builds the real email, quoting included, when it sends.
+    thread_id is either the Gmail threadId, which the gateway has, or the
+    16-bit hash of it, which is all the endpoint ever sees. Sender and
+    subject are left empty: the gateway looks the original message up by
+    thread and builds the real email, quoting included, when it sends.
     """
-    thread = short_hash(thread_id)
+    thread = thread_id if isinstance(thread_id, int) else short_hash(thread_id)
     data = encode("", "", int(time.time()) // 60, thread, one_line(body),
                   FLAG_OUTBOUND | FLAG_REPLY)
-    return chunk(message_id or thread_id, data)
+    return chunk(str(message_id or thread_id), data)
 
 
 def compose_packets(address, subject, body):
