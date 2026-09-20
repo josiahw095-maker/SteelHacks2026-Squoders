@@ -43,6 +43,8 @@ class Station:
         self.port = port
         self.mock = mock
         self.lock = threading.Lock()
+        self.send_lock = threading.Lock()  # serializes Send() across threads;
+                                            # see Send() for why
         self.messages = []          # decoded inbound mail, oldest first
         self.groups = {}            # packets still waiting for their siblings
         self.sent = []              # what we pushed back, for the UI to show
@@ -283,6 +285,13 @@ class Station:
     def Send(self, packets, gap = 2.0, on_progress = None):
         """Put packets on the air, pausing between them for airtime.
 
+        Chase(), Reply() and Compose() all call this from whatever HTTP
+        request thread happens to invoke them, and the browser can have
+        several requests in flight at once (the steady state poll plus
+        watchProgress()'s faster one while a send is running). send_lock
+        keeps two of those from calling sendData() at the same time and
+        interleaving their transmissions.
+
         on_progress(sent, total) is called after each packet so a caller can
         show how far along the send is; a full packet is seconds of airtime,
         which is long enough to be worth showing.
@@ -293,19 +302,20 @@ class Station:
             if on_progress:
                 on_progress(sent, total)
 
-        if self.link is None:
-            for position in range(total):     # demo mode: pretend, but pace it
-                time.sleep(0.2)
-                report(position + 1)
-            return total
+        with self.send_lock:
+            if self.link is None:
+                for position in range(total):     # demo mode: pretend, but pace it
+                    time.sleep(0.2)
+                    report(position + 1)
+                return total
 
-        for position, packet in enumerate(packets):
-            self.link.sendData(packet)
-            self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
-            report(position + 1)
-            if position < total - 1:
-                time.sleep(gap)
-        return total
+            for position, packet in enumerate(packets):
+                self.link.sendData(packet)
+                self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
+                report(position + 1)
+                if position < total - 1:
+                    time.sleep(gap)
+            return total
 
     def Reply(self, thread, body, on_progress = None):
         """Reply into a conversation. thread is the 16-bit hash we received."""
