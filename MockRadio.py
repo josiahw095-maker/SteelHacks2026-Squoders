@@ -35,6 +35,19 @@ PORT_NAME = "loopback"
 _counter = itertools.count()
 
 
+class _EmptyQueue:
+    """Enough of meshtastic's QueueStatus for MeshSend to pace against.
+
+    A folder has no airtime and no shared medium, so this side's TX queue is
+    always empty. Without it MeshSend sees no queueStatus at all, decides the
+    firmware is too old to report one, and falls back to sleeping
+    SEND_GAP_SECONDS per packet - four seconds each, a minute for a full
+    email, waiting on a radio that is not there.
+    """
+    free = 1
+    maxlen = 1
+
+
 def IsLoopback(target):
     return bool(target) and str(target).strip().lower() == PORT_NAME
 
@@ -54,6 +67,7 @@ class LoopbackInterface:
     def __init__(self, direction = "down", node_id = "!loopback"):
         self.direction = direction
         self.node_id = node_id
+        self.queueStatus = _EmptyQueue()
         self.send_box, self.recv_box = _Box(direction)
         for box in (self.send_box, self.recv_box):
             box.mkdir(parents = True, exist_ok = True)

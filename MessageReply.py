@@ -33,6 +33,18 @@ _groups_lock = threading.Lock()
 _replies = []
 _replies_lock = threading.Lock()
 
+# Chunk ids of messages already decoded, so a packet the mesh delivers twice
+# cannot complete a second copy of the same reply. A reply usually fits in
+# ONE packet, so without this a single duplicate is a whole extra group that
+# completes immediately and sends the same email through Gmail again. It has
+# to expire: the id is 16 bits and will legitimately come round again, and a
+# reply the user really did send twice is a real second reply.
+# Station.Accept has guarded the endpoint this way all along.
+DONE_WINDOW = 45
+MAX_DONE = 60
+
+_done = {}                  # chunk id -> when it was decoded; under _groups_lock
+
 
 # --- receiving --------------------------------------------------------------
 
@@ -45,13 +57,26 @@ def Collect(payload):
     key = bytes(payload[:2])
 
     with _groups_lock:
+        seen_at = _done.get(key)
+        if seen_at is not None and time.time() - seen_at < DONE_WINDOW:
+            return None            # a late duplicate of a finished message
+
         group = _groups.setdefault(key, {"packets": [], "seen": 0.0})
+        if bytes(payload) in group["packets"]:
+            return None            # the same packet twice; it adds nothing
         group["packets"].append(bytes(payload))
         group["seen"] = time.time()
         data = MeshCodec.reassemble(group["packets"])
         if data is None:
             return None            # still missing packets, or they disagree
         del _groups[key]
+
+        now = time.time()
+        _done[key] = now
+        if len(_done) > MAX_DONE:
+            for stale in [k for k, t in _done.items()
+                          if now - t > DONE_WINDOW][:len(_done) - MAX_DONE]:
+                del _done[stale]
 
     try:
         message = MeshCodec.decode_message(data)
@@ -92,12 +117,18 @@ def Drain():
 
 
 def Expire(now = None):
-    """Forget half-received replies that will never complete."""
+    """Forget half-received replies that will never complete.
+
+    Also drops chunk ids whose duplicate window has passed, so _done cannot
+    grow for the length of a run.
+    """
     now = now if now is not None else time.time()
     with _groups_lock:
         stale = [k for k, g in _groups.items() if now - g["seen"] > GROUP_TIMEOUT]
         for key in stale:
             del _groups[key]
+        for key in [k for k, t in _done.items() if now - t > DONE_WINDOW]:
+            del _done[key]
     return len(stale)
 
 

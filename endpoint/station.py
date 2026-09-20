@@ -214,6 +214,19 @@ class Station:
         now = now if now is not None else time.time()
         asks = []
 
+        # A send already in flight owns the radio. Chasing now would block on
+        # send_lock until that send finished - and this runs on the browser's
+        # poll, so the page would freeze exactly while it most wants to draw
+        # progress. A stalled group is still stalled at the next poll, so
+        # nothing is lost by skipping this round; the request counters are
+        # left alone too, since we did not actually ask for anything.
+        # (A send that starts in the gap between this probe and Send() below
+        # only puts us back where we were, so the probe is worth having even
+        # though it is not airtight.)
+        if not self.send_lock.acquire(blocking = False):
+            return []
+        self.send_lock.release()
+
         with self.lock:
             for key, group in self.groups.items():
                 if now - group["seen"] < REQUEST_AFTER:
@@ -283,7 +296,7 @@ class Station:
 
     # --- what the UI writes ------------------------------------------------
 
-    def Send(self, packets, gap = 2.0, on_progress = None):
+    def Send(self, packets, on_progress = None):
         """Put packets on the air, waiting after each for the radio's own TX
         queue to report empty before handing over the next - never more than
         one packet outstanding at once, confirmed by the device itself
@@ -314,9 +327,13 @@ class Station:
 
             for position, packet in enumerate(packets):
                 self.link.sendData(packet)
-                self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
-                report(position + 1)
-                MeshSend.wait_for_clear_queue(self.link)
+                report(position + 1)      # the bar moves on the handover...
+                waited, gave_up = MeshSend.wait_for_clear_queue(self.link)
+                # ...and the feed line lands when the radio says the packet
+                # is really gone, with what that took.
+                self.Note("tx", f"packet out ({position + 1}/{total})"
+                                f" - queue clear in {waited:.2f} s"
+                                + (" - GAVE UP" if gave_up else ""), len(packet))
             return total
 
     def Reply(self, thread, body, on_progress = None):

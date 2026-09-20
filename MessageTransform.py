@@ -4,6 +4,8 @@ import re
 from email.header import decode_header, make_header
 from email.utils import parseaddr
 
+from MeshCodec import quote_cut
+
 def get_header(message, name):
     """Find one header, case insensitively. Returns "" if abesnt"""
     for header in message["payload"].get("headers", []):
@@ -68,55 +70,26 @@ def html_to_text(raw):
     text = re.sub(r"[ \t]+", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
-# Reply history and signatures: everything from the first match to the end of
-# the body is history, so we cut rather than filter line by line.
-QUOTE_MARKERS = [
-    re.compile(r"^>"),                                          # quoted line
-    re.compile(r"\bwrote:\s*$"),                                # "... Alice <a@x> wrote:"
-    re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}", re.I),  # Outlook
-    re.compile(r"^\s*From:\s+\S"),                              # Outlook header block
-    re.compile(r"^\s*_{5,}\s*$"),                               # Outlook rule
-    re.compile(r"^--\s*$"),                                     # signature delimiter
-    re.compile(r"^\s*Sent from my \w+", re.I),                  # mobile signature
-]
-
 # Quoted history in HTML mail, caught before the tags get stripped away.
+# The plain-text markers are NOT repeated here: they live in MeshCodec, which
+# is the single place that decides where an email ends.
 QUOTE_HTML = re.compile(r"(?i)<blockquote|<div[^>]*gmail_quote")
-
-
-# Gmail wraps "On <date> <name> wrote:" across two lines, so a match on the
-# second half would leave the first half behind. These let us back up to the
-# start of the attribution.
-ATTRIBUTION_OPEN = re.compile(r"^\s*On\b")
-WROTE_END = re.compile(r"\bwrote:\s*$")
 
 
 def strip_quotes(body):
     """Drop reply history and signatures from the end of a plain-text body.
 
-    Everything from the first marker onward is history, so this cuts rather
-    than filtering line by line. Falls back to the original when stripping
-    would leave nothing, so a forward-only mail still carries something.
+    Where to cut is MeshCodec.quote_cut's decision rather than a second copy
+    of the same markers: the codec cuts again before chunking, and two lists
+    that had drifted apart would disagree about where an email ends. Falls
+    back to the original when stripping would leave nothing, so a
+    forward-only mail still carries something.
     """
     lines = body.splitlines()
-
-    cut = None
-    for index, line in enumerate(lines):
-        if any(marker.search(line) for marker in QUOTE_MARKERS):
-            cut = index
-            break
-
+    cut = quote_cut(lines)
     if cut is None:
         return body.strip()
-
-    if WROTE_END.search(lines[cut]) and not ATTRIBUTION_OPEN.search(lines[cut]):
-        for back in range(cut - 1, max(-1, cut - 3), -1):
-            if ATTRIBUTION_OPEN.search(lines[back]):
-                cut = back
-                break
-
-    stripped = "\n".join(lines[:cut]).strip()
-    return stripped or body.strip()
+    return "\n".join(lines[:cut]).strip() or body.strip()
 
 
 def transform(message):

@@ -15,6 +15,7 @@ transport and the screen is unchanged.
 import json
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -44,8 +45,25 @@ def SetProgress(**fields):
         progress.update(fields)
 
 
-def Options():
+# Enumerating serial ports goes through the Windows registry, which is slow
+# enough to notice on the faster poll that runs during a send - and the state
+# snapshot asks for it every time. The list almost never changes mid-demo, so
+# a few seconds of staleness is free; the sidebar's own refresh asks for a
+# fresh one.
+PORTS_TTL = 5.0
+ports_cache = {"at": 0.0, "options": None}
+ports_lock = threading.Lock()
+
+
+def Options(fresh = False, now = None):
     """Transports the browser can offer: the two fakes, then real ports."""
+    now = now if now is not None else time.time()
+    if not fresh:
+        with ports_lock:
+            if (ports_cache["options"] is not None
+                    and now - ports_cache["at"] < PORTS_TTL):
+                return ports_cache["options"]
+
     options = [
         {"value": "demo", "label": "Demo - sample mail, no radio"},
         {"value": "loopback", "label": "Loopback - real codec, packets via folder"},
@@ -58,7 +76,23 @@ def Options():
                             "label": f"{port.device} - {port.description}{radio}"})
     except Exception:
         pass
+
+    with ports_lock:
+        ports_cache["at"], ports_cache["options"] = now, options
     return options
+
+
+def Current():
+    """The station as it stands right now.
+
+    Connect() swaps the global out from under whatever is running, so a
+    request takes ONE reference and works from it - otherwise a snapshot can
+    start on one radio and finish on another. The lock is deliberately not
+    held for the work itself: a send runs for half a minute, and the state
+    poll has to get through while it does.
+    """
+    with station_lock:
+        return station
 
 
 def Connect(target):
@@ -76,11 +110,12 @@ def Connect(target):
 
 def Snapshot():
     """Everything the page needs, in one object."""
-    station.Poll()
-    station.Chase()
+    st = Current()
+    st.Poll()
+    st.Chase()
 
     threads = []
-    for thread, messages in station.Threads():
+    for thread, messages in st.Threads():
         newest = messages[-1]
         threads.append({
             "thread": thread,
@@ -98,19 +133,19 @@ def Snapshot():
             } for m in messages],
         })
 
-    inbox = station.Inbox()
+    inbox = st.Inbox()
     with progress_lock:
         current = dict(progress)
 
     return {
-        "status": station.Status(),
+        "status": st.Status(),
         "target": current_target,
         "options": Options(),
-        "node": station.node_id,
-        "error": station.error,
+        "node": st.node_id,
+        "error": st.error,
         "threads": threads,
         "waiting": [{"id": k, "packets": v[0], "asked": v[1]}
-                    for k, v in station.Waiting().items()],
+                    for k, v in st.Waiting().items()],
         "totals": {
             "messages": len(inbox),
             "airbytes": sum(m["airbytes"] for m in inbox),
@@ -118,7 +153,7 @@ def Snapshot():
             "packets": sum(m["packets"] for m in inbox),
         },
         "progress": current,
-        "feed": station.Feed(),
+        "feed": st.Feed(),
     }
 
 
@@ -156,7 +191,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             return self.Reply(200, Snapshot())
         if path == "/api/ports":
-            return self.Reply(200, {"options": Options(), "target": current_target})
+            return self.Reply(200, {"options": Options(fresh = True),
+                                    "target": current_target})
 
         name = "index.html" if path == "/" else path.lstrip("/")
         target = (WEB / name).resolve()
@@ -183,16 +219,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.Reply(200, {"ok": False,
                                         "error": f"{type(error).__name__}: {error}"})
             current_target = target
-            failed = station.error and target not in ("demo", "loopback")
+            st = Current()
+            failed = st.error and target not in ("demo", "loopback")
             return self.Reply(200, {"ok": not failed, "status": status,
-                                    "error": station.error})
+                                    "error": st.error})
 
         if self.path == "/api/reply":
             text = (body.get("body") or "").strip()
             if not text:
                 return self.Reply(400, {"ok": False, "error": "nothing to send"})
+            st = Current()
             return self.Reply(200, Send("Sending reply", lambda tick:
-                station.Reply(body["thread"], text, on_progress=tick)))
+                st.Reply(body["thread"], text, on_progress=tick)))
 
         if self.path == "/api/compose":
             to = (body.get("to") or "").strip()
@@ -201,9 +239,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.Reply(400, {"ok": False, "error": "that is not an address"})
             if not text:
                 return self.Reply(400, {"ok": False, "error": "nothing to send"})
+            st = Current()
             return self.Reply(200, Send("Sending", lambda tick:
-                station.Compose(to, (body.get("subject") or "").strip(), text,
-                                on_progress=tick)))
+                st.Compose(to, (body.get("subject") or "").strip(), text,
+                           on_progress=tick)))
 
         return self.Reply(404, {"ok": False, "error": "no such endpoint"})
 

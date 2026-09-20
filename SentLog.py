@@ -42,10 +42,14 @@ def Remember(account, thread_hash, email):
         "rfc_id": email.get("rfc_id", ""),
     }
 
-    # Oldest first, so trimming drops the entries least likely to be replied to.
+    # Oldest first, so trimming drops the entries least likely to be replied
+    # to. The guard matters: below MAX_ENTRIES the excess is NEGATIVE, and
+    # list(log)[:-n] slices from the far end, so an unguarded trim deletes
+    # the NEWEST entries instead - 100 of them at 150 remembered threads.
     excess = len(log) - MAX_ENTRIES
-    for key in list(log)[:excess]:
-        del log[key]
+    if excess > 0:
+        for key in list(log)[:excess]:
+            del log[key]
 
     path = LogPath(account)
     path.parent.mkdir(parents = True, exist_ok = True)

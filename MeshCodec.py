@@ -45,7 +45,11 @@ Chunk (each mesh packet, at most MAX_PAYLOAD bytes):
 
     <id: 2 bytes> <part<<4 | total: 1 byte> <slice of the message>
 
-    id      crc32 of the Gmail message id, low 16 bits; groups the packets
+    id      crc32 of a name for THIS message, low 16 bits; groups the
+            packets. Mail from the gateway is named by its Gmail message
+            id; anything the endpoint originates is named by a per-send
+            unique value, because an id that repeats makes the receiver
+            pool two different messages into one group and lose both.
     part    0-based INDEX of this packet   (0 .. total-1)
     total   1-based COUNT of packets        (1 .. MAX_PARTS)
             The two use different conventions but share one byte, so
@@ -58,6 +62,7 @@ undecodable, so encode() trims the body until everything fits in MAX_CHUNKS.
 DICT, MAX_SENDER and MAX_SUBJECT are part of the format. The endpoint app must
 embed the identical DICT bytes; changing it breaks every deployed app.
 """
+import itertools
 import re
 import struct
 import time
@@ -112,6 +117,26 @@ def truncate_bytes(text, max_bytes):
 def short_hash(text):
     """The 16-bit id used for both the chunk group and the thread."""
     return zlib.crc32((text or "").encode()) & 0xFFFF
+
+
+_sequence = itertools.count()
+
+
+def unique_name(kind, thread):
+    """A name for one outgoing message that no later message will reuse.
+
+    Only mail from Gmail arrives with an id of its own. Everything the
+    endpoint sends - replies, composed mail, resend requests - used to be
+    named after its CONVERSATION, so every reply into one thread shared a
+    chunk id. Two of those in flight get pooled into one group by the
+    receiver, and reassemble() keeps whichever part arrived last: one reply
+    is silently dropped, or the two splice into a record that will not
+    decode and both are lost.
+
+    The id is still only 16 bits, so a collision remains possible. What
+    this removes is the guarantee of one.
+    """
+    return "%s-%s-%.6f-%d" % (kind, thread, time.time(), next(_sequence))
 
 
 def one_line(text):
@@ -258,11 +283,16 @@ def reply_packets(thread_id, body, message_id=""):
     16-bit hash of it, which is all the endpoint ever sees. Sender and
     subject are left empty: the gateway looks the original message up by
     thread and builds the real email, quoting included, when it sends.
+
+    message_id names THIS reply, not the conversation it belongs to. Left
+    empty it falls back to a per-send unique name rather than to the
+    thread, which two replies would share; see unique_name().
     """
     thread = thread_id if isinstance(thread_id, int) else short_hash(thread_id)
     data = encode("", "", int(time.time()) // 60, thread, one_line(body),
                   FLAG_OUTBOUND | FLAG_REPLY)
-    return chunk(str(message_id or thread_id), data)
+    return chunk(str(message_id) if message_id else unique_name("reply", thread),
+                 data)
 
 
 def compose_packets(address, subject, body):
@@ -277,7 +307,7 @@ def compose_packets(address, subject, body):
     address = truncate_bytes(one_line(address), MAX_ADDRESS)
     subject = shorten(one_line(subject), MAX_SUBJECT)
     data = encode(address, subject, minutes, 0, one_line(body), FLAG_OUTBOUND)
-    return chunk("%s|%s|%d" % (address, subject, minutes), data)
+    return chunk(unique_name("compose", short_hash(address)), data)
 
 
 def missing_parts(packets):
@@ -296,7 +326,10 @@ def missing_parts(packets):
             return None
         parts.add(part)
 
-    if total is None:
+    # None means no packets at all; 0 means a corrupt header claiming a
+    # zero-part message. Neither is something to ask for, and range(0)
+    # would hand back [], which the caller reads as "complete".
+    if not total:
         return None
     return sorted(set(range(total)) - parts)
 
@@ -307,14 +340,17 @@ def request_packets(group_id, wanted):
     The message being chased rides in the thread field, which is the same
     two bytes as the chunk id, and the wanted parts travel as "0,3,7" in the
     body. A request is always one packet, so it cannot itself go missing in
-    pieces. Its own chunk id is derived separately so it never collides with
-    the message it is asking about.
+    pieces. Its own chunk id is unique per ask, which keeps it clear both of
+    the message it is asking about and of the PREVIOUS ask for that same
+    message: Chase() asks up to MAX_REQUESTS times, and a receiver that
+    drops repeated ids as duplicates would otherwise ignore every ask but
+    the first.
     """
     group = group_id if isinstance(group_id, int) else short_hash(group_id)
     data = encode("", "", int(time.time()) // 60, group,
                   ",".join(str(part) for part in wanted),
                   FLAG_OUTBOUND | FLAG_REQUEST)
-    return chunk("request-%d" % group, data)
+    return chunk(unique_name("request", group), data)
 
 
 def wanted_parts(message):

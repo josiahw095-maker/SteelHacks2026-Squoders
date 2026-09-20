@@ -14,12 +14,23 @@ from collections import OrderedDict
 # Fallback pacing, used only when the radio never reports a queue depth at
 # all (old firmware). A full 200-byte packet is roughly 2 s of airtime at
 # LONG_FAST, and every hop rebroadcasts what it hears.
-SEND_GAP_SECONDS = 2.0
+SEND_GAP_SECONDS = 4.0
 
 # How long to wait for the device's own TX queue to report empty before
 # giving up and moving on anyway - a jammed queue would otherwise stall the
 # whole message forever - and how often to check.
-QUEUE_CLEAR_TIMEOUT = 10.0
+#
+# This is an escape hatch, not pacing. It belongs well above how long a
+# packet really takes to clear, so that it fires only when something is
+# wedged. That holds only if this firmware reports the queue DRAINING; if it
+# only reports on enqueue, free never climbs back on its own and every
+# packet burns the whole timeout instead. send_packets() prints the measured
+# clear time per packet, so one real run tells you which of the two it is.
+QUEUE_CLEAR_TIMEOUT = 15.0
+
+# Polling costs a memory read: queueStatus is a cached protobuf that the
+# interface's reader thread updates, not a round trip to the radio. A coarse
+# poll would just add dead air to every packet.
 QUEUE_POLL_SECONDS = 0.1
 
 
@@ -31,14 +42,24 @@ def wait_for_clear_queue(link, timeout = QUEUE_CLEAR_TIMEOUT, poll = QUEUE_POLL_
     yet, not a guess about airtime. If this firmware never reports a queue
     depth at all (queueStatus stays None), there is nothing to wait on, and
     the caller's own SEND_GAP_SECONDS pause is the only pacing available.
+
+    Returns (seconds waited, whether the timeout fired). Giving up means the
+    next packet goes out with this one still outstanding - the very burst
+    this is here to prevent - so the caller says so rather than hiding it.
     """
     if getattr(link, "queueStatus", None) is None:
         time.sleep(SEND_GAP_SECONDS)
-        return
-    waited = 0.0
-    while link.queueStatus.free < link.queueStatus.maxlen and waited < timeout:
+        return SEND_GAP_SECONDS, False
+
+    # Timed against the clock rather than counted in poll intervals, so the
+    # number that comes back is what actually elapsed.
+    start = time.time()
+    while link.queueStatus.free < link.queueStatus.maxlen:
+        waited = time.time() - start
+        if waited >= timeout:
+            return waited, True
         time.sleep(poll)
-        waited += poll
+    return time.time() - start, False
 
 
 def scan():
@@ -82,7 +103,7 @@ def remember_sent(packets):
         _recent.popitem(last = False)
 
 
-def resend(link, group, wanted, gap = SEND_GAP_SECONDS, dest = None):
+def resend(link, group, wanted, dest = None):
     """Put the named parts of a remembered message back on the air.
 
     Returns how many were resent; 0 means we no longer have that message,
@@ -99,11 +120,11 @@ def resend(link, group, wanted, gap = SEND_GAP_SECONDS, dest = None):
             chosen.append(packet)
 
     if chosen:
-        send_packets(link, chosen, dest = dest, gap = gap, remember = False)
+        send_packets(link, chosen, dest = dest, remember = False)
     return len(chosen)
 
 
-def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
+def send_packets(link, packets, dest=None, remember=True):
     """Send packets one at a time, waiting after each for the radio's own TX
     queue to report empty before handing over the next - never more than one
     packet outstanding at once, confirmed by the device itself rather than
@@ -127,7 +148,10 @@ def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
             link.sendData(packet, destinationId = dest)
         else:
             link.sendData(packet)
-        print("  sent      %s" % label)
-        wait_for_clear_queue(link)
+        waited, gave_up = wait_for_clear_queue(link)
+        # The measurement that settles QUEUE_CLEAR_TIMEOUT: how long this
+        # radio's own queue really took to drain, packet by packet.
+        print("  sent      %s  queue clear in %5.2f s%s"
+              % (label, waited, "   GAVE UP - sending anyway" if gave_up else ""))
 
     return total
