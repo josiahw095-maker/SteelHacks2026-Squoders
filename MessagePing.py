@@ -4,6 +4,7 @@
     python MessagePing.py <account> COM6          send over USB serial
     python MessagePing.py <account>               send over Bluetooth
     ... add  --dest !435c4ce4  (or set MESH_DEST) to address one node directly
+    ... add  --timing  to have the endpoint report when each packet arrived
 
 Without --dest the gateway addresses the peer it last heard from, or the only
 other node it has heard lately, and broadcasts only if it knows neither.
@@ -45,7 +46,7 @@ def SplitArgs(argv, environ = None):
     --dest may appear anywhere; MESH_DEST in the environment is the fallback.
     """
     environ = os.environ if environ is None else environ
-    args, dest = list(argv), None
+    args, dest = [a for a in argv if a != "--timing"], None
     if "--dest" in args:
         at = args.index("--dest")
         if at + 1 >= len(args):
@@ -135,6 +136,7 @@ def CurrentHistoryId(service):
 
 
 if __name__ == "__main__":
+    timing = "--timing" in sys.argv[1:]
     try:
         args, pinned = SplitArgs(sys.argv[1:])
         if pinned:
@@ -143,7 +145,7 @@ if __name__ == "__main__":
         print(error)
         sys.exit(1)
     if len(args) < 1:
-        print("usage: python MessagePing.py <account-name> [--dry-run | <port-or-ble-address>] [--dest !nodeid]")
+        print("usage: python MessagePing.py <account-name> [--dry-run | <port-or-ble-address>] [--dest !nodeid] [--timing]")
         sys.exit(1)
     account = args[0]
     target = args[1] if len(args) > 1 else None
@@ -193,6 +195,7 @@ if __name__ == "__main__":
                 message = WithBackoff(
                     lambda: ReqMessage(service, message_id), "messages.get")
                 email = transform(message)
+                email["want_timing"] = timing
                 packets = to_packets(email)
                 print("")
                 print(f"{email['sender']}: {email['subject']}  ->  {len(packets)} packet(s)")
@@ -219,9 +222,10 @@ if __name__ == "__main__":
             Expire()
             for reply in Drain():
                 print("")
-                kind = ("resend request" if reply["request"]
+                kind = ("timing report" if reply["timing"]
+                        else "resend request" if reply["request"]
                         else "reply" if reply["reply"] else "new email")
-                print(f"{kind} from the endpoint: {reply['body'][:60]!r}")
+                print(f"{kind} from the endpoint" + ("" if reply["timing"] else f": {reply['body'][:60]!r}"))
                 try:
                     Deliver(service, account, reply, dry_run = link is None,
                             link = link)

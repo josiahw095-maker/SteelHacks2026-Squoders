@@ -23,7 +23,13 @@ Message (the bytes that get chunked):
                      gateway -> endpoint
     bit 3  REQUEST   not mail at all: a plea to resend the parts listed in
                      the body, for the message named in the thread field
-    bits 4-7         reserved (use them for a format version if this changes)
+    bit 4  WANT_TIMING  gateway -> endpoint: please send back a timing report
+                     once this message is complete (a diagnostic; see below)
+    bit 5  TIMING    endpoint -> gateway: not mail; a timing report for the
+                     message named in the thread field. The body is
+                     "<first arrival, epoch ms> <part>:<ms after the first> ..."
+                     giving when the endpoint received each packet.
+    bits 6-7         reserved (use them for a format version if this changes)
 
     record  <time:   4 bytes, big-endian uint32, UTC minutes since the epoch>
             <thread: 2 bytes, big-endian uint16, crc32 of the Gmail threadId>
@@ -84,6 +90,8 @@ FLAG_DEFLATE = 0x01
 FLAG_REPLY = 0x02
 FLAG_OUTBOUND = 0x04
 FLAG_REQUEST = 0x08
+FLAG_WANT_TIMING = 0x10
+FLAG_TIMING = 0x20
 
 # Shared compression dictionary. Deflate favors the END of the dictionary, so
 # the most common material goes last. Replace with phrases mined from real mail.
@@ -271,6 +279,8 @@ def to_packets(email):
     subject = shorten(one_line(email["subject"]), MAX_SUBJECT)
     thread = short_hash(email.get("thread") or email["id"])
     flags = FLAG_REPLY if email.get("reply") else 0
+    if email.get("want_timing"):
+        flags |= FLAG_WANT_TIMING
     data = encode(sender, subject, email["date"] // 60, thread,
                   strip_body(email["body"]), flags)
     return chunk(email["id"], data)
@@ -354,6 +364,37 @@ def wanted_parts(message):
     return out
 
 
+def timing_packets(group_id, arrivals):
+    """A timing report, endpoint -> gateway: when each packet of a message arrived.
+
+    arrivals maps part index to the epoch seconds it was received. Times are
+    sent as "first arrival" plus millisecond offsets, so the gaps between
+    packets mean something even if the two machines' clocks disagree.
+    """
+    group = group_id if isinstance(group_id, int) else short_hash(group_id)
+    first = min(arrivals.values())
+    body = str(int(round(first * 1000))) + " " + " ".join(
+        "%d:%d" % (part, round((moment - first) * 1000))
+        for part, moment in sorted(arrivals.items()))
+    data = encode("", "", int(time.time()) // 60, group, body,
+                  FLAG_OUTBOUND | FLAG_TIMING)
+    return chunk("timing-%d" % group, data)
+
+
+def parse_timing(message):
+    """(first arrival in epoch ms, {part: ms after the first}) from a timing
+    report, or None if the body cannot be read."""
+    try:
+        first, *rest = (message.get("body") or "").split()
+        offsets = {}
+        for item in rest:
+            part, ms = item.split(":")
+            offsets[int(part)] = int(ms)
+        return int(first), offsets
+    except ValueError:
+        return None
+
+
 # --- Inverse: what the endpoint app has to do (kept here as the reference) ---
 
 def reassemble(packets):
@@ -395,6 +436,8 @@ def decode_message(data):
         "reply": bool(flags & FLAG_REPLY),
         "outbound": bool(flags & FLAG_OUTBOUND),
         "request": bool(flags & FLAG_REQUEST),
+        "want_timing": bool(flags & FLAG_WANT_TIMING),
+        "timing": bool(flags & FLAG_TIMING),
         "sender": sender.decode(),
         "subject": subject.decode(),
         "body": body.decode(),

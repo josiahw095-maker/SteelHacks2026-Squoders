@@ -135,6 +135,10 @@ is acknowledged before the next goes out. Three things you can tune:
   ```
   python MessagePing.py my-account COM6 --dest !435c4ce4
   ```
+- **Timing.** To see where the time goes, add `--timing` to the gateway command.
+  It prints when each packet was sent and acknowledged, and the endpoint sends back
+  when each one arrived; the gateway then prints the two side by side. The endpoint's
+  live feed shows arrival times to the millisecond.
 - **Email size.** An email is capped at 6 packets (`MeshCodec.MAX_CHUNKS`); a longer
   body is trimmed and ends in `…`.
 

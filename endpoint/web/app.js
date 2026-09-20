@@ -17,6 +17,15 @@ let lastCount = 0;               // to notice new mail arriving
 const clock = (t) => new Date(t * 1000)
   .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+/* The live feed shows seconds and milliseconds: it is how you read the gaps
+ * between packets, which is what the timing diagnostics are about. */
+const clockMs = (t) => {
+  const d = new Date(t * 1000);
+  // 24-hour, like the gateway's log, so the two can be read side by side.
+  return d.toLocaleTimeString([], { hourCycle: "h23", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    + "." + String(d.getMilliseconds()).padStart(3, "0");
+};
+
 function esc(text) {
   const n = document.createElement("div");
   n.textContent = text == null ? "" : text;
@@ -106,7 +115,7 @@ function renderFeed(feed) {
   el("rail-count").textContent = feed.length ? feed.length + " recent" : "";
   el("feed").innerHTML = feed.length
     ? feed.map((e) => `<div class="ev ${esc(e.kind)}">
-        <time>${clock(e.at)}</time>
+        <time>${clockMs(e.at)}</time>
         <span class="what">${esc(e.text)}</span>
         <span class="sz">${e.bytes ? e.bytes + " B" : ""}</span></div>`).join("")
     : `<div class="empty">Nothing on the air yet.</div>`;

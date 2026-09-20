@@ -28,6 +28,10 @@ MAX_REQUESTS = 3
 # Lines kept for the live feed on screen.
 MAX_EVENTS = 200
 
+# How long after a message completes before its timing report goes back, so
+# it does not collide with the gateway's last ack.
+REPORT_DELAY = 3.0
+
 # Chunk ids remembered briefly after decoding, so a late duplicate - a
 # resend that lands once the message is already complete - is dropped rather
 # than starting a phantom group that never finishes. It has to EXPIRE: the
@@ -53,6 +57,7 @@ class Station:
         self.sent = []              # what we pushed back, for the UI to show
         self.events = []            # a running log for the screen
         self.done = {}              # chunk id -> when it was decoded
+        self.reports = []           # timing reports waiting to be sent back
         self.link = None
         self.node_id = None
         self.error = None
@@ -107,27 +112,34 @@ class Station:
         Separate from OnReceive so the endpoint can be driven with bytes in
         tests, with no radio anywhere.
         """
+        arrived_at = time.time()             # as close to the moment of receipt as we can get
         key = bytes(payload[:2])
+        part, total = ((payload[2] >> 4, payload[2] & 0x0F) if len(payload) >= 3
+                       else (None, None))
 
         with self.lock:
             seen_at = self.done.get(key)
             if seen_at is not None and time.time() - seen_at < DONE_WINDOW:
                 return None                  # a late duplicate of that message
 
-        self.Note("rx", f"packet in  ({key.hex()})", len(payload))
+        where = f" part {part + 1}/{total}" if part is not None else ""
+        self.Note("rx", f"packet in  ({key.hex()}){where}", len(payload))
 
         with self.lock:
             group = self.groups.setdefault(key, {"packets": [], "seen": 0.0})
             if bytes(payload) in group["packets"]:
                 return None                  # same packet twice; ignore
             group["packets"].append(bytes(payload))
-            group["seen"] = time.time()
+            group["seen"] = arrived_at
+            if part is not None:
+                group.setdefault("times", {}).setdefault(part, arrived_at)
             data = MeshCodec.reassemble(group["packets"])
             if data is None:
                 return None
             # Capture what the delivery cost before the group is discarded.
             packet_count = len(group["packets"])
             air_bytes = sum(len(p) for p in group["packets"])
+            times = dict(group.get("times", {}))
             del self.groups[key]
             now = time.time()
             self.done[key] = now
@@ -159,6 +171,15 @@ class Station:
                          + message["body"]).encode("utf-8"))
         message["delivered"] = delivered
         message["ratio"] = (delivered / air_bytes) if air_bytes else 0.0
+
+        message["arrivals"] = times
+        if times:
+            print("  received  %s  %s" % (key.hex(), "  ".join(
+                f"{p + 1}@{MeshSend.stamp(t)}" for p, t in sorted(times.items()))))
+        if message.get("want_timing") and times:
+            with self.lock:
+                self.reports.append({"due": time.time() + REPORT_DELAY,
+                                     "group": int.from_bytes(key, "big"), "times": times})
 
         with self.lock:
             self.messages.append(message)
@@ -245,7 +266,27 @@ class Station:
                 self.Send(MeshCodec.request_packets(group_id, missing))
             except SendFailed:
                 pass                         # noted already; the next pass asks again
+
+        self.FlushReports(now)
         return asks
+
+    def FlushReports(self, now = None):
+        """Send back the timing report of any message that asked for one.
+
+        Held for REPORT_DELAY after the message completes, so the report does
+        not collide with the gateway's last ack. Returns how many went out.
+        """
+        now = now if now is not None else time.time()
+        with self.lock:
+            due = [r for r in self.reports if r["due"] <= now]
+            self.reports = [r for r in self.reports if r["due"] > now]
+
+        for report in due:
+            try:
+                self.Send(MeshCodec.timing_packets(report["group"], report["times"]))
+            except SendFailed:
+                pass                         # a diagnostic; not worth retrying
+        return len(due)
 
     def Expire(self, now = None):
         """Forget half-received messages that will never complete."""

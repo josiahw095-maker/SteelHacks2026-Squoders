@@ -310,36 +310,69 @@ def ack_timeout(link):
     return max(MIN_ACK_WAIT, ACK_AIRTIMES * seconds)
 
 
-def _send_once(link, packet, dest, timeout):
+def stamp(moment):
+    """A clock time with milliseconds, e.g. 12:03:41.207, for the timing log."""
+    return time.strftime("%H:%M:%S", time.localtime(moment)) + ".%03d" % int((moment % 1) * 1000)
+
+
+# What each recent message's packets did, keyed by the 2-byte chunk id, so a
+# timing report from the far end can be laid beside our own send and ack times.
+_timelines = OrderedDict()
+
+
+def timeline_for(group):
+    """The send/ack record of a recent message, or None if we no longer have it.
+
+    A list with one entry per packet: part, size, sent_at and acked_at (epoch
+    seconds; acked_at is None if no ack came), outcome and attempts.
+    """
+    return _timelines.get(group)
+
+
+def _send_once(link, packet, dest, timeout, label = ""):
     """Send one packet and wait for its answer.
 
-    Returns "NONE" for an ack, the firmware's error name for a NAK (for
-    example "MAX_RETRANSMIT"), or "TIMEOUT" if nothing came back in time.
+    Returns (outcome, sent_at, answered_at). outcome is "NONE" for an ack, the
+    firmware's error name for a NAK (for example "MAX_RETRANSMIT"), or
+    "TIMEOUT" if nothing came back in time; answered_at is when the answer
+    reached us, or None.
     """
     answered = threading.Event()
-    outcome = []
+    outcome, when = [], []
 
     def on_response(reply):
-        # Called on the radio's own thread. Each attempt owns its event, so a
-        # late answer to an earlier attempt cannot be mistaken for this one.
+        # Called on the radio's own thread. The time is taken here, so it is
+        # when the ack arrived, not when this thread got round to noticing.
+        # Each attempt owns its event, so a late answer to an earlier attempt
+        # cannot be mistaken for this one.
+        moment = time.time()
         routing = ((reply or {}).get("decoded") or {}).get("routing") or {}
         outcome.append(routing.get("errorReason", "NONE"))
+        when.append(moment)
         answered.set()
 
+    sent_at = time.time()
     _transmit(link, packet, dest, onResponse = on_response, onResponseAckPermitted = True)
+    if label:
+        print("  sent      %s  at %s" % (label, stamp(sent_at)))
     if not answered.wait(timeout):
-        return "TIMEOUT"
-    return outcome[0]
+        return "TIMEOUT", sent_at, None
+    return outcome[0], sent_at, when[0]
 
 
-def _send_confirmed(link, packet, dest, tries = ACK_TRIES):
-    """Send one packet until it is acknowledged or the tries run out."""
-    outcome = "TIMEOUT"
-    for _ in range(tries):
-        outcome = _send_once(link, packet, dest, ack_timeout(link))
+def _send_confirmed(link, packet, dest, tries = ACK_TRIES, label = ""):
+    """Send one packet until it is acknowledged or the tries run out.
+
+    Returns a dict: outcome, sent_at (the first attempt), acked_at, attempts.
+    """
+    first_sent, outcome = None, "TIMEOUT"
+    for attempt in range(1, tries + 1):
+        outcome, sent_at, acked_at = _send_once(link, packet, dest, ack_timeout(link), label)
+        first_sent = first_sent or sent_at
         if outcome == "NONE":
-            return "NONE"
-    return outcome
+            return {"outcome": "NONE", "sent_at": first_sent, "acked_at": acked_at,
+                    "attempts": attempt}
+    return {"outcome": outcome, "sent_at": first_sent, "acked_at": None, "attempts": tries}
 
 
 def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None, wait_ack=False):
@@ -354,6 +387,9 @@ def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None
     because a broadcast has nobody to acknowledge it. Otherwise packets are
     spaced by gap, which None sets to whatever suits the link (see pace()).
 
+    Every packet's send time is printed, and in ack mode its ack time too. The
+    record is kept (see timeline_for) for comparing with the far end's report.
+
     on_sent(position, total) is called after each packet that went out.
     """
     if dest:
@@ -367,22 +403,31 @@ def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None
 
     total = len(packets)
     done = 0
+    entries = []
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))
+        entry = {"part": position, "size": len(packet), "sent_at": None,
+                 "acked_at": None, "outcome": None, "attempts": 0}
+        entries.append(entry)
         if link is None:
             print("  [dry-run] %s  %s" % (label, packet.hex()))
         elif confirm:
-            outcome = _send_confirmed(link, packet, dest)
-            if outcome != "NONE":
+            entry.update(_send_confirmed(link, packet, dest, label = label))
+            if entry["outcome"] != "NONE":
                 print("  FAILED    %s  %s; not sending the other %d"
-                      % (label, outcome, total - position - 1))
+                      % (label, entry["outcome"], total - position - 1))
                 if _learned.get("id") == dest:
                     forget_peer()             # do not keep addressing a node that is not answering
                 break
-            print("  acked     %s  by %s" % (label, dest))
+            print("  acked     %s  by %s at %s  (+%.3f s%s)"
+                  % (label, dest, stamp(entry["acked_at"]), entry["acked_at"] - entry["sent_at"],
+                     "" if entry["attempts"] == 1 else ", after %d tries" % entry["attempts"]))
         else:
+            entry["sent_at"] = time.time()
             _transmit(link, packet, dest)
-            print("  sent      %s  %s" % (label, "to " + dest if dest else "(broadcast)"))
+            entry.update(outcome = "SENT", attempts = 1)
+            print("  sent      %s  %s  at %s"
+                  % (label, "to " + dest if dest else "(broadcast)", stamp(entry["sent_at"])))
 
         done += 1
         if on_sent:
@@ -390,4 +435,8 @@ def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None
         if position < total - 1:
             time.sleep(gap)
 
+    if remember and packets:
+        _timelines[struct.unpack(">H", packets[0][:2])[0]] = entries
+        while len(_timelines) > RECENT_LIMIT:
+            _timelines.popitem(last = False)
     return done
