@@ -146,7 +146,13 @@ function renderThreads(threads) {
 
   box.innerHTML = threads.map((t, i) => {
     const isOpen = openThreads.has(String(t.thread)) || (openThreads.size === 0 && i === 0);
-    const body = t.messages.map((m) => {
+    /* The server sends only the recent tail of a long conversation, so say
+     * so rather than letting the rest vanish without a word. */
+    const older = t.older
+      ? `<div class="msg"><div class="meta">${t.older} earlier message${
+          t.older === 1 ? "" : "s"} not shown</div></div>`
+      : "";
+    const body = older + t.messages.map((m) => {
       const pct = Math.max(6, Math.min(100, Math.round((1 - m.airbytes / Math.max(m.delivered, 1)) * 100)));
       return `<div class="msg">
         <div class="from"><strong style="color:var(--ink)">${esc(m.sender || "unknown")}</strong>
@@ -199,10 +205,18 @@ function renderThreads(threads) {
 
 /* ---------- server ---------- */
 
+let stateVersion = "";           // what the server last sent us
+
 async function refresh() {
   if (sending) return;
   try {
-    const state = await (await fetch("/api/state")).json();
+    /* Hand back the version we already hold. A quiet radio means the server
+     * answers "unchanged" in a few dozen bytes and we skip every render
+     * below, including the JSON.stringify diffing in changed(). */
+    const url = "/api/state" + (stateVersion ? "?v=" + encodeURIComponent(stateVersion) : "");
+    const state = await (await fetch(url)).json();
+    if (state.unchanged) return;
+    stateVersion = state.v || "";
     renderStatus(state);
     renderStats(state.totals);
     renderRail(state);
@@ -217,13 +231,26 @@ async function refresh() {
   }
 }
 
+/* Forget both caches and redraw from scratch. Needed wherever the page has
+ * changed something itself - clearing a reply box, switching transport -
+ * because the server may well hand back the same state it did last time,
+ * and "unchanged" would otherwise skip the redraw we are asking for. */
+function forceRefresh() {
+  stateVersion = "";
+  for (const key of Object.keys(drawn)) delete drawn[key];
+  return refresh();
+}
+
 async function watchProgress(track) {
   const fill = track.querySelector("i");
   track.classList.add("on");
   fill.style.width = "5%";
+  /* /api/progress, not /api/state: this runs three times a second, and the
+   * full state carries every thread and every body with it - 225 KB a poll
+   * once the inbox has a few hundred messages in it. */
   while (sending) {
     try {
-      const p = (await (await fetch("/api/state")).json()).progress;
+      const p = await (await fetch("/api/progress")).json();
       if (p && p.total) fill.style.width = Math.round((p.sent / p.total) * 100) + "%";
       if (p && !p.active) break;
     } catch (err) { break; }
@@ -271,10 +298,9 @@ async function sendReply(form) {
   if (ok) {
     delete drafts[form.dataset.reply];
     area.value = "";
-    delete drawn.threads;          // force one redraw so the box clears
     toast("Reply sent", "good");
   }
-  refresh();
+  forceRefresh();
 }
 
 /* ---------- wiring ---------- */
@@ -294,7 +320,7 @@ el("transport").addEventListener("change", async (e) => {
     toast("could not reach the server", "bad");
   }
   lastCount = 0;
-  refresh();
+  forceRefresh();
 });
 
 const sheet = el("sheet");
