@@ -64,6 +64,9 @@ class Station:
         """Open the node. Any failure is recorded, never raised, so the UI
         can show it instead of dying on import."""
         try:
+            # A different radio may be firmware that does report its
+            # TX queue draining, so stop holding the last one against it.
+            MeshSend.forget_queue_trust()
             from MockRadio import IsLoopback, LoopbackInterface
             if IsLoopback(self.port):
                 # No radio: packets arrive through a folder, so there is no

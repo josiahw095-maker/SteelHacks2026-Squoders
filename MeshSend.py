@@ -20,18 +20,40 @@ SEND_GAP_SECONDS = 4.0
 # giving up and moving on anyway - a jammed queue would otherwise stall the
 # whole message forever - and how often to check.
 #
-# This is an escape hatch, not pacing. It belongs well above how long a
-# packet really takes to clear, so that it fires only when something is
-# wedged. That holds only if this firmware reports the queue DRAINING; if it
-# only reports on enqueue, free never climbs back on its own and every
-# packet burns the whole timeout instead. send_packets() prints the measured
-# clear time per packet, so one real run tells you which of the two it is.
-QUEUE_CLEAR_TIMEOUT = 15.0
+# This is an escape hatch, not pacing. It belongs above how long a packet
+# really takes to clear, so that it fires only when something is wedged -
+# but it is now also the cost of LEARNING that a radio never reports its
+# queue draining, paid QUEUE_TRUST_LIMIT times before we stop asking. On the
+# measured run every packet ran the clock out at 15 s while packets were
+# plainly getting through, so 15 s bought nothing but 30 s of dead air per
+# session. Six is still triple the ~2 s airtime of a full 200-byte packet at
+# LONG_FAST.
+QUEUE_CLEAR_TIMEOUT = 6.0
 
 # Polling costs a memory read: queueStatus is a cached protobuf that the
 # interface's reader thread updates, not a round trip to the radio. A coarse
 # poll would just add dead air to every packet.
 QUEUE_POLL_SECONDS = 0.1
+
+# Some firmware sends a QueueStatus only when a packet is ENQUEUED, never
+# again when it is actually transmitted. free then never climbs back to
+# maxlen, so waiting for an empty queue can only ever end in the timeout -
+# measured here as every single packet reporting "GAVE UP" at exactly the
+# timeout while the mesh delivered them normally. Waiting on a signal that
+# cannot arrive is worse than not waiting: it is a fixed delay wearing the
+# costume of real feedback. After this many consecutive timeouts we stop
+# believing the queue and pace on airtime instead.
+QUEUE_TRUST_LIMIT = 2
+
+_queue_timeouts = 0
+_queue_trusted = True
+
+
+def forget_queue_trust():
+    """Believe the queue again. Call when a different radio is opened - the
+    next one may be firmware that does report the drain."""
+    global _queue_timeouts, _queue_trusted
+    _queue_timeouts, _queue_trusted = 0, True
 
 
 def wait_for_clear_queue(link, timeout = QUEUE_CLEAR_TIMEOUT, poll = QUEUE_POLL_SECONDS):
@@ -46,8 +68,12 @@ def wait_for_clear_queue(link, timeout = QUEUE_CLEAR_TIMEOUT, poll = QUEUE_POLL_
     Returns (seconds waited, whether the timeout fired). Giving up means the
     next packet goes out with this one still outstanding - the very burst
     this is here to prevent - so the caller says so rather than hiding it.
+    Airtime pacing is not "giving up": it is the deliberate fallback for a
+    radio whose queue we have learned says nothing useful.
     """
-    if getattr(link, "queueStatus", None) is None:
+    global _queue_timeouts, _queue_trusted
+
+    if getattr(link, "queueStatus", None) is None or not _queue_trusted:
         time.sleep(SEND_GAP_SECONDS)
         return SEND_GAP_SECONDS, False
 
@@ -56,9 +82,20 @@ def wait_for_clear_queue(link, timeout = QUEUE_CLEAR_TIMEOUT, poll = QUEUE_POLL_
     start = time.time()
     while link.queueStatus.free < link.queueStatus.maxlen:
         waited = time.time() - start
-        if waited >= timeout:
-            return waited, True
-        time.sleep(poll)
+        if waited < timeout:
+            time.sleep(poll)
+            continue
+
+        _queue_timeouts += 1
+        if _queue_timeouts >= QUEUE_TRUST_LIMIT:
+            _queue_trusted = False
+            print("  this radio never reports its TX queue draining (free %d "
+                  "of %d after %d waits); pacing on %.1f s of airtime instead"
+                  % (link.queueStatus.free, link.queueStatus.maxlen,
+                     _queue_timeouts, SEND_GAP_SECONDS))
+        return waited, True
+
+    _queue_timeouts = 0         # it drained; the signal is real after all
     return time.time() - start, False
 
 
@@ -75,6 +112,7 @@ def open_link(target=None):
     tests use; anything else is treated as a Bluetooth name or address.
     """
     from MockRadio import IsLoopback, LoopbackInterface
+    forget_queue_trust()
     if IsLoopback(target):
         # No radio at all: packets go through a folder. See MockRadio.py.
         return LoopbackInterface(direction = "down")
@@ -149,9 +187,13 @@ def send_packets(link, packets, dest=None, remember=True):
         else:
             link.sendData(packet)
         waited, gave_up = wait_for_clear_queue(link)
-        # The measurement that settles QUEUE_CLEAR_TIMEOUT: how long this
-        # radio's own queue really took to drain, packet by packet.
-        print("  sent      %s  queue clear in %5.2f s%s"
-              % (label, waited, "   GAVE UP - sending anyway" if gave_up else ""))
+        # The measurement that settles the pacing: how long this radio's own
+        # queue really took, packet by packet, and what it claimed to hold.
+        status = getattr(link, "queueStatus", None)
+        depth = "" if status is None else "  (%d/%d free)" % (status.free,
+                                                              status.maxlen)
+        print("  sent      %s  waited %5.2f s%s%s"
+              % (label, waited, depth,
+                 "   GAVE UP - sending anyway" if gave_up else ""))
 
     return total
