@@ -29,19 +29,6 @@ GROUP_TIMEOUT = 300
 _groups = {}
 _groups_lock = threading.Lock()
 
-# A repeat of a request we already served this recently is ignored. The
-# endpoint asks again when a message has been quiet for a while, and its timer
-# can run out while our resend is still on the air - on 2026-09-20 that made
-# the gateway send the same four parts twice, 82 s of airtime that delivered
-# nothing. Serving the first request is the answer to both.
-#
-# This has to cover one resend on the air (about 13 s for a full six parts at
-# LONG_FAST) and no more. If the resend is genuinely lost the endpoint asks
-# again, and by then its backoff has pushed the second ask well past this, so
-# the repeat that matters is still served.
-RESEND_DEBOUNCE = 20
-_resent = {}
-
 # Finished replies waiting for the poll loop. Queue is already thread-safe.
 _replies = []
 _replies_lock = threading.Lock()
@@ -86,11 +73,8 @@ def OnReceive(packet, interface = None):
     if decoded.get("portnum") != "PRIVATE_APP":
         return
     payload = decoded.get("payload")
-    if payload and Collect(payload) is not None:
-        # A whole valid message from the endpoint: now we know who it is, so
-        # our packets can go to it directly instead of to everyone.
-        from MeshSend import note_peer
-        note_peer(packet.get("fromId"))
+    if payload:
+        Collect(payload)
 
 
 def Listen():
@@ -200,7 +184,7 @@ def SendNew(service, message, dry_run = False):
 def Resend(link, message):
     """Put back on the air the parts a receiver says it never got."""
     from MeshCodec import wanted_parts
-    from MeshSend import resend, pick_dest
+    from MeshSend import resend
 
     wanted = wanted_parts(message)
     if not wanted:
@@ -209,17 +193,7 @@ def Resend(link, message):
         print(f"  [dry-run] would resend parts {wanted} of 0x{message['thread']:04x}")
         return None
 
-    now = time.time()
-    key = (message["thread"], tuple(wanted))
-    for stale in [k for k, when in _resent.items() if now - when > RESEND_DEBOUNCE]:
-        del _resent[stale]
-    if key in _resent:
-        print(f"  already resending parts {wanted} of 0x{message['thread']:04x}; ignoring the repeat")
-        return 0
-    _resent[key] = now
-
-    dest = pick_dest(link)
-    count = resend(link, message["thread"], wanted, dest = dest, wait_ack = bool(dest))
+    count = resend(link, message["thread"], wanted)
     if count:
         print(f"  resent {count} packet(s) of 0x{message['thread']:04x}")
     else:
@@ -227,83 +201,15 @@ def Resend(link, message):
     return count
 
 
-def _clock(moment):
-    from MeshSend import stamp
-    return stamp(moment) if moment else "-"
-
-
-def _seconds(value):
-    return "%.3f" % value if value is not None else "-"
-
-
-# One row of the timing table. Every cell is a single token, so a row can be read
-# back with split() and the columns stay lined up whatever is missing.
-TIMING_ROW = "{:>5}  {:>12}  {:>12}  {:>8}  {:>12}  {:>7}  {:>7}  {:>8}{}"
-
-
-def ShowTiming(message):
-    """Print the endpoint's arrival times beside our own send and ack times.
-
-    The two machines' clocks may not agree, so the gap columns are the ones to
-    trust: time between our sends, time between their arrivals. The last column
-    is a one-way delay only if both clocks are synced.
-
-    Returns a summary dict (also handy for tests), or None if unreadable.
-    """
-    import MeshSend
-    parsed = MeshCodec.parse_timing(message)
-    if parsed is None:
-        print("  timing report could not be read")
-        return None
-    first_ms, offsets = parsed
-    group = message["thread"]
-    ours = {e["part"]: e for e in (MeshSend.timeline_for(group) or [])}
-    if not ours:
-        print("  (no send record for that message: it was sent before this run)")
-
-    print(f"  timing for message {group:04x}")
-    print(TIMING_ROW.format("part", "sent", "ack in", "ack wait", "received", "gap tx", "gap rx", "tx->rx*", ""))
-    print(TIMING_ROW.format("", "(gateway)", "(gateway)", "", "(endpoint)", "", "", "", ""))
-    prev_sent = prev_rx = None
-    waits, tx_gaps, rx_gaps = [], [], []
-    for part in sorted(set(ours) | set(offsets)):
-        entry = ours.get(part, {})
-        sent, acked = entry.get("sent_at"), entry.get("acked_at")
-        rx = (first_ms + offsets[part]) / 1000 if part in offsets else None
-        wait = acked - sent if sent and acked else None
-        tx_gap = sent - prev_sent if sent and prev_sent else None
-        rx_gap = rx - prev_rx if rx and prev_rx else None
-        transit = rx - sent if rx and sent else None
-        for value, bucket in ((wait, waits), (tx_gap, tx_gaps), (rx_gap, rx_gaps)):
-            if value is not None:
-                bucket.append(value)
-        note = "" if entry.get("attempts", 1) <= 1 else f"  ({entry['attempts']} tries)"
-        print(TIMING_ROW.format(part + 1, _clock(sent), _clock(acked), _seconds(wait), _clock(rx),
-                                _seconds(tx_gap), _seconds(rx_gap), _seconds(transit), note))
-        prev_sent, prev_rx = sent or prev_sent, rx or prev_rx
-
-    print("  * one-way delay, valid only if both machines' clocks are in sync")
-    summary = {"ack_wait_max": max(waits, default = None), "ack_wait_avg": (sum(waits) / len(waits)) if waits else None,
-               "tx_gap_max": max(tx_gaps, default = None), "rx_gap_max": max(rx_gaps, default = None),
-               "parts_reported": len(offsets), "parts_sent": len(ours)}
-    if waits:
-        print("   ack wait: average %.3f s, longest %.3f s" % (summary["ack_wait_avg"], summary["ack_wait_max"]))
-    if rx_gaps:
-        print("   longest silence the endpoint saw between packets: %.3f s" % summary["rx_gap_max"])
-    return summary
-
-
 def Deliver(service, account, message, dry_run = False, link = None):
     """Act on one decoded outbound message, whichever kind it is.
 
-    TIMING is a diagnostic report, not mail. REQUEST is a plea to resend
-    packets. OUTBOUND with REPLY set is a reply to a thread we remember;
-    OUTBOUND on its own is a new email that carries its own recipient.
+    REQUEST is a plea to resend packets, not mail. OUTBOUND with REPLY set
+    is a reply to a thread we remember; OUTBOUND on its own is a new email
+    that carries its own recipient.
     """
     if not message.get("outbound"):
         return None
-    if message.get("timing"):
-        return ShowTiming(message)
     if message.get("request"):
         return Resend(link, message)
     if message.get("reply"):

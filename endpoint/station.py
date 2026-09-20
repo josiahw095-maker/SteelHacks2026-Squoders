@@ -15,30 +15,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import MeshCodec
-import MeshSend
 
 # A half-received message is forgotten after this long.
 GROUP_TIMEOUT = 300
 
 # How long a message may stall before we ask for the missing parts, and
 # how many times we are willing to ask.
-#
-# Each further wait is REQUEST_BACKOFF times the last. Asking again while the
-# gateway is still working through the previous request is worse than useless:
-# it spends airtime on parts already in flight, and the answer to it arrives
-# after the message is complete. The gateway needs roughly two seconds per
-# missing part plus the request's own flight, so the first wait covers a full
-# resend and the backoff covers a slow or lossy one.
 REQUEST_AFTER = 20
-REQUEST_BACKOFF = 2.0
 MAX_REQUESTS = 3
 
 # Lines kept for the live feed on screen.
 MAX_EVENTS = 200
-
-# How long after a message completes before its timing report goes back, so
-# it does not collide with the gateway's last ack.
-REPORT_DELAY = 3.0
 
 # Chunk ids remembered briefly after decoding, so a late duplicate - a
 # resend that lands once the message is already complete - is dropped rather
@@ -47,10 +34,6 @@ REPORT_DELAY = 3.0
 # is only 16 bits so it will legitimately come round again.
 DONE_WINDOW = 45
 MAX_DONE = 60
-
-
-class SendFailed(RuntimeError):
-    """Some packets were never acknowledged, so the message did not get through."""
 
 
 class Station:
@@ -65,11 +48,9 @@ class Station:
         self.sent = []              # what we pushed back, for the UI to show
         self.events = []            # a running log for the screen
         self.done = {}              # chunk id -> when it was decoded
-        self.reports = []           # timing reports waiting to be sent back
         self.link = None
         self.node_id = None
         self.error = None
-        self.peer = None            # the gateway's node id, once one of its emails has arrived
 
         if not mock:
             self.Connect()
@@ -109,45 +90,35 @@ class Station:
             return
         payload = decoded.get("payload")
         if payload:
-            self.Accept(payload, source = packet.get("fromId"))
+            self.Accept(payload)
 
-    def Accept(self, payload, source = None):
+    def Accept(self, payload):
         """Feed one packet in. Returns the message if that completed one.
-
-        source is the node id it came from. A complete email from a node tells
-        us who the gateway is, so replies can go to it directly.
 
         Separate from OnReceive so the endpoint can be driven with bytes in
         tests, with no radio anywhere.
         """
-        arrived_at = time.time()             # as close to the moment of receipt as we can get
         key = bytes(payload[:2])
-        part, total = ((payload[2] >> 4, payload[2] & 0x0F) if len(payload) >= 3
-                       else (None, None))
 
         with self.lock:
             seen_at = self.done.get(key)
             if seen_at is not None and time.time() - seen_at < DONE_WINDOW:
                 return None                  # a late duplicate of that message
 
-        where = f" part {part + 1}/{total}" if part is not None else ""
-        self.Note("rx", f"packet in  ({key.hex()}){where}", len(payload))
+        self.Note("rx", f"packet in  ({key.hex()})", len(payload))
 
         with self.lock:
             group = self.groups.setdefault(key, {"packets": [], "seen": 0.0})
             if bytes(payload) in group["packets"]:
                 return None                  # same packet twice; ignore
             group["packets"].append(bytes(payload))
-            group["seen"] = arrived_at
-            if part is not None:
-                group.setdefault("times", {}).setdefault(part, arrived_at)
+            group["seen"] = time.time()
             data = MeshCodec.reassemble(group["packets"])
             if data is None:
                 return None
             # Capture what the delivery cost before the group is discarded.
             packet_count = len(group["packets"])
             air_bytes = sum(len(p) for p in group["packets"])
-            times = dict(group.get("times", {}))
             del self.groups[key]
             now = time.time()
             self.done[key] = now
@@ -165,12 +136,6 @@ class Station:
             return None                      # our own send heard back
 
         self.Note("mail", f"decoded: {message['subject'] or '(no subject)'}", air_bytes)
-        if source:
-            try:
-                self.peer = MeshSend.normalize_dest(source)
-            except ValueError:
-                pass
-
         message["at"] = time.time()
         message["packets"] = packet_count
         message["airbytes"] = air_bytes
@@ -179,15 +144,6 @@ class Station:
                          + message["body"]).encode("utf-8"))
         message["delivered"] = delivered
         message["ratio"] = (delivered / air_bytes) if air_bytes else 0.0
-
-        message["arrivals"] = times
-        if times:
-            print("  received  %s  %s" % (key.hex(), "  ".join(
-                f"{p + 1}@{MeshSend.stamp(t)}" for p, t in sorted(times.items()))))
-        if message.get("want_timing") and times:
-            with self.lock:
-                self.reports.append({"due": time.time() + REPORT_DELAY,
-                                     "group": int.from_bytes(key, "big"), "times": times})
 
         with self.lock:
             self.messages.append(message)
@@ -257,45 +213,21 @@ class Station:
 
         with self.lock:
             for key, group in self.groups.items():
-                asked = group.get("requests", 0)
-                if now - group["seen"] < REQUEST_AFTER * REQUEST_BACKOFF ** asked:
+                if now - group["seen"] < REQUEST_AFTER:
                     continue
-                if asked >= MAX_REQUESTS:
+                if group.get("requests", 0) >= MAX_REQUESTS:
                     continue
                 missing = MeshCodec.missing_parts(group["packets"])
                 if not missing:
                     continue
-                group["requests"] = asked + 1
+                group["requests"] = group.get("requests", 0) + 1
                 group["seen"] = now          # back off before asking again
                 asks.append((int.from_bytes(key, "big"), missing))
 
         for group_id, missing in asks:
             self.Note("ask", f"asked for parts {missing} of {group_id:04x}")
-            try:
-                self.Send(MeshCodec.request_packets(group_id, missing))
-            except SendFailed:
-                pass                         # noted already; the next pass asks again
-
-        self.FlushReports(now)
+            self.Send(MeshCodec.request_packets(group_id, missing))
         return asks
-
-    def FlushReports(self, now = None):
-        """Send back the timing report of any message that asked for one.
-
-        Held for REPORT_DELAY after the message completes, so the report does
-        not collide with the gateway's last ack. Returns how many went out.
-        """
-        now = now if now is not None else time.time()
-        with self.lock:
-            due = [r for r in self.reports if r["due"] <= now]
-            self.reports = [r for r in self.reports if r["due"] > now]
-
-        for report in due:
-            try:
-                self.Send(MeshCodec.timing_packets(report["group"], report["times"]))
-            except SendFailed:
-                pass                         # a diagnostic; not worth retrying
-        return len(due)
 
     def Expire(self, now = None):
         """Forget half-received messages that will never complete."""
@@ -341,41 +273,31 @@ class Station:
 
     # --- what the UI writes ------------------------------------------------
 
-    def Send(self, packets, gap = None, on_progress = None):
+    def Send(self, packets, gap = 2.0, on_progress = None):
         """Put packets on the air, pausing between them for airtime.
 
-        Goes to the gateway directly once we know who it is, and to the whole
-        channel until then. gap of None paces to the radio's real speed.
         on_progress(sent, total) is called after each packet so a caller can
-        show how far along the send is.
+        show how far along the send is; a full packet is seconds of airtime,
+        which is long enough to be worth showing.
         """
         total = len(packets)
 
-        def report(sent, of):
+        def report(sent):
             if on_progress:
-                on_progress(sent, of)
+                on_progress(sent, total)
 
         if self.link is None:
             for position in range(total):     # demo mode: pretend, but pace it
                 time.sleep(0.2)
-                report(position + 1, total)
+                report(position + 1)
             return total
 
-        dest = self.peer
-
-        def sent(position, of):
-            self.Note("tx", f"packet out ({position}/{of})" + (f" to {dest}" if dest else ""),
-                      len(packets[position - 1]))
-            report(position, of)
-
-        confirmed = MeshSend.send_packets(self.link, packets, dest = dest, gap = gap,
-                                          remember = False, on_sent = sent,
-                                          wait_ack = bool(dest))
-        if confirmed < total:
-            self.peer = None                 # stop addressing a node that is not answering
-            self.Note("ask", f"only {confirmed} of {total} packets were acknowledged")
-            raise SendFailed(f"only {confirmed} of {total} packets were acknowledged "
-                             "- the other end did not answer")
+        for position, packet in enumerate(packets):
+            self.link.sendData(packet, wantAck = True)
+            self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
+            report(position + 1)
+            if position < total - 1:
+                time.sleep(gap)
         return total
 
     def Reply(self, thread, body, on_progress = None):

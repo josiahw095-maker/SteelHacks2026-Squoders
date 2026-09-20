@@ -23,13 +23,7 @@ Message (the bytes that get chunked):
                      gateway -> endpoint
     bit 3  REQUEST   not mail at all: a plea to resend the parts listed in
                      the body, for the message named in the thread field
-    bit 4  WANT_TIMING  gateway -> endpoint: please send back a timing report
-                     once this message is complete (a diagnostic; see below)
-    bit 5  TIMING    endpoint -> gateway: not mail; a timing report for the
-                     message named in the thread field. The body is
-                     "<first arrival, epoch ms> <part>:<ms after the first> ..."
-                     giving when the endpoint received each packet.
-    bits 6-7         reserved (use them for a format version if this changes)
+    bits 4-7         reserved (use them for a format version if this changes)
 
     record  <time:   4 bytes, big-endian uint32, UTC minutes since the epoch>
             <thread: 2 bytes, big-endian uint16, crc32 of the Gmail threadId>
@@ -74,15 +68,9 @@ MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
 MAX_ADDRESS = 100   # bytes; a recipient address is never shortened
 HEADER = 3          # bytes of chunk header (id + part/total)
-MAX_PARTS = 15      # part and total share one byte, 4 bits each: the header's hard limit
-MAX_CHUNKS = 6      # the body is trimmed until the email fits in this many packets.
-                    # Each packet is ~2 s on the air at LONG_FAST plus the pause
-                    # between them, so 6 is about 15 s (with acks) and 15 would
-                    # hold the radio for over a minute.
-MAX_EXPANSION = 50  # text this much larger than the budget is cut before it is
-                    # even compressed, so a huge email costs milliseconds, not
-                    # seconds. Ordinary text shrinks 2-3x; only pathological
-                    # repetition beats 50x, and that is what this still allows.
+MAX_PARTS = 15      # part and total share one byte, 4 bits each
+MAX_CHUNKS = MAX_PARTS  # trim the body only when it will not fit even in a
+                        # full set of packets, which is the header's limit
 RECORD_HEAD = 6     # bytes of record header (4 time + 2 thread)
 ELLIPSIS = "…"  # 3 bytes in UTF-8, marks text that was cut
 
@@ -90,8 +78,6 @@ FLAG_DEFLATE = 0x01
 FLAG_REPLY = 0x02
 FLAG_OUTBOUND = 0x04
 FLAG_REQUEST = 0x08
-FLAG_WANT_TIMING = 0x10
-FLAG_TIMING = 0x20
 
 # Shared compression dictionary. Deflate favors the END of the dictionary, so
 # the most common material goes last. Replace with phrases mined from real mail.
@@ -231,33 +217,14 @@ def pack(sender, subject, minutes, thread, body, flags):
 
 def encode(sender, subject, minutes, thread, body, flags):
     """Pack, trimming the body (marked with an ellipsis) until the result fits
-    in MAX_CHUNKS packets. Trimming happens on the text, before compression.
-
-    When it does not fit, the longest body that does is found by bisection, so
-    an email only just over the limit loses only what it must. (Shaving 10% at
-    a time threw away up to a tenth of the text, about 400 bytes, for nothing.)
-    """
+    in MAX_CHUNKS packets. Trimming happens on the text, before compression."""
     limit = MAX_CHUNKS * (MAX_PAYLOAD - HEADER)
-
-    size = len(body.encode())
-    if size > limit * MAX_EXPANSION:
-        body = shorten(body, limit * MAX_EXPANSION)
+    while True:
+        data = pack(sender, subject, minutes, thread, body, flags)
+        if len(data) <= limit or not body:
+            return data
         size = len(body.encode())
-
-    data = pack(sender, subject, minutes, thread, body, flags)
-    if len(data) <= limit or not body:
-        return data
-
-    best, low, high = pack(sender, subject, minutes, thread, "", flags), 0, size
-    while high - low > 1:                          # low fits, high does not
-        middle = (low + high) // 2
-        kept = shorten(body, middle) if middle > len(ELLIPSIS.encode()) else ""
-        candidate = pack(sender, subject, minutes, thread, kept, flags)
-        if len(candidate) <= limit:
-            low, best = middle, candidate
-        else:
-            high = middle
-    return best
+        body = shorten(body, size * 9 // 10) if size > 12 else ""
 
 
 def chunk(group_id, data):
@@ -279,8 +246,6 @@ def to_packets(email):
     subject = shorten(one_line(email["subject"]), MAX_SUBJECT)
     thread = short_hash(email.get("thread") or email["id"])
     flags = FLAG_REPLY if email.get("reply") else 0
-    if email.get("want_timing"):
-        flags |= FLAG_WANT_TIMING
     data = encode(sender, subject, email["date"] // 60, thread,
                   strip_body(email["body"]), flags)
     return chunk(email["id"], data)
@@ -364,37 +329,6 @@ def wanted_parts(message):
     return out
 
 
-def timing_packets(group_id, arrivals):
-    """A timing report, endpoint -> gateway: when each packet of a message arrived.
-
-    arrivals maps part index to the epoch seconds it was received. Times are
-    sent as "first arrival" plus millisecond offsets, so the gaps between
-    packets mean something even if the two machines' clocks disagree.
-    """
-    group = group_id if isinstance(group_id, int) else short_hash(group_id)
-    first = min(arrivals.values())
-    body = str(int(round(first * 1000))) + " " + " ".join(
-        "%d:%d" % (part, round((moment - first) * 1000))
-        for part, moment in sorted(arrivals.items()))
-    data = encode("", "", int(time.time()) // 60, group, body,
-                  FLAG_OUTBOUND | FLAG_TIMING)
-    return chunk("timing-%d" % group, data)
-
-
-def parse_timing(message):
-    """(first arrival in epoch ms, {part: ms after the first}) from a timing
-    report, or None if the body cannot be read."""
-    try:
-        first, *rest = (message.get("body") or "").split()
-        offsets = {}
-        for item in rest:
-            part, ms = item.split(":")
-            offsets[int(part)] = int(ms)
-        return int(first), offsets
-    except ValueError:
-        return None
-
-
 # --- Inverse: what the endpoint app has to do (kept here as the reference) ---
 
 def reassemble(packets):
@@ -436,8 +370,6 @@ def decode_message(data):
         "reply": bool(flags & FLAG_REPLY),
         "outbound": bool(flags & FLAG_OUTBOUND),
         "request": bool(flags & FLAG_REQUEST),
-        "want_timing": bool(flags & FLAG_WANT_TIMING),
-        "timing": bool(flags & FLAG_TIMING),
         "sender": sender.decode(),
         "subject": subject.decode(),
         "body": body.decode(),

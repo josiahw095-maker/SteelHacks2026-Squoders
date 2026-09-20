@@ -50,16 +50,9 @@ def Main():
     parser.add_argument("port_b", help="node that receives the channel, e.g. COM5")
     parser.add_argument("--name", default="SquodersNet", help="channel name (max 11 chars)")
     parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
-    parser.add_argument("--preset", help="also set this modem preset on both nodes first, "
-                        "e.g. SHORT_FAST (faster, shorter range; default is LONG_FAST)")
     args = parser.parse_args()
     if len(args.name.encode()) > 11:
         sys.exit("channel name must be 11 bytes or fewer")
-
-    if args.preset:
-        from set_preset import SetPresets
-        if not SetPresets([args.port_a, args.port_b], args.preset, Connect):
-            sys.exit("could not put both nodes on the same preset; nothing else was changed")
 
     a, b = Connect(args.port_a), Connect(args.port_b)
     if config_pb2.Config.LoRaConfig.UNSET == a.localNode.localConfig.lora.region:

@@ -7,100 +7,13 @@ The packets are raw bytes, so they go out with sendData on the private port
 (PortNum.PRIVATE_APP, the library default), never sendText.
 """
 
-import math
-import re
 import struct
-import threading
 import time
 from collections import OrderedDict
 
-# Pause between packets when we cannot tell how fast the radio is. Sized for
-# LONG_FAST, where one 200-byte packet is about 1.9 s on the air.
-#
-# This was briefly raised to 5 s to cure packets going missing. It did not:
-# the 2026-09-20 hardware run lost 4 of 6 packets at a 6 s spacing. The loss
-# was the firmware retransmitting broadcasts (see _transmit), not our pacing,
-# and the wider gap only made every message two to three times slower.
+# Courtesy gap between packets. A full 200-byte packet is roughly 2 s of
+# airtime at LONG_FAST, and every hop rebroadcasts what it hears.
 SEND_GAP_SECONDS = 2.0
-
-
-# The size the codec fills packets to (MeshCodec.MAX_PAYLOAD).
-PACKET_BYTES = 200
-
-# Meshtastic wraps our payload in a 16-byte mesh header plus a little protobuf.
-FRAME_OVERHEAD = 22
-
-# Pause = this many packet-airtimes, so a fast preset is not held back by a
-# gap sized for a slow one. Just over 1x: the packet is off the air before the
-# next is queued, which is all the spacing has to achieve.
-GAP_AIRTIMES = 1.1
-MIN_GAP = 0.3
-
-# (spread factor, bandwidth in Hz, coding-rate denominator) for each preset,
-# from Meshtastic's modem preset table. Anything not listed falls back to
-# SEND_GAP_SECONDS rather than guessing.
-PRESETS = {
-    "SHORT_TURBO":   (7, 500e3, 5),
-    "SHORT_FAST":    (7, 250e3, 5),
-    "SHORT_SLOW":    (8, 250e3, 5),
-    "MEDIUM_FAST":   (9, 250e3, 5),
-    "MEDIUM_SLOW":   (10, 250e3, 5),
-    "LONG_FAST":     (11, 250e3, 5),
-    "LONG_MODERATE": (11, 125e3, 8),
-    "LONG_SLOW":     (12, 125e3, 8),
-}
-
-
-def airtime(frame_bytes, sf, bandwidth, cr = 5, preamble = 16):
-    """Seconds one LoRa frame occupies the channel (the Semtech formula).
-
-    cr is the coding-rate denominator, 5 for 4/5 up to 8 for 4/8. Meshtastic
-    sends an explicit header with CRC on, and a 16-symbol preamble.
-    """
-    symbol = (2 ** sf) / bandwidth
-    optimize = 1 if symbol > 0.016 else 0            # low-data-rate optimisation
-    payload_symbols = 8 + max(math.ceil((8 * frame_bytes - 4 * sf + 28 + 16)
-                                        / (4 * (sf - 2 * optimize))) * cr, 0)
-    return (payload_symbols + preamble + 4.25) * symbol
-
-
-def radio_params(link):
-    """(sf, bandwidth, cr) the link's radio is set to, or None if we cannot tell."""
-    try:
-        lora = link.localNode.localConfig.lora
-        if lora.use_preset:
-            from meshtastic.protobuf import config_pb2
-            name = config_pb2.Config.LoRaConfig.ModemPreset.Name(lora.modem_preset)
-            return PRESETS.get(name)
-        if lora.spread_factor and lora.bandwidth:
-            return (lora.spread_factor, lora.bandwidth * 1000, lora.coding_rate or 5)
-    except (AttributeError, ValueError):
-        pass
-    return None
-
-
-def packet_airtime(link, size = PACKET_BYTES):
-    """Seconds one of our packets takes on this link's radio, or None if unknown."""
-    params = radio_params(link)
-    return None if params is None else airtime(size + FRAME_OVERHEAD, *params)
-
-
-def pace(link):
-    """Seconds to wait between packets on this link.
-
-    A link may carry its own answer in `gap_hint` (the mock radio does, since
-    a folder needs no airtime). Otherwise the pause follows the radio's real
-    airtime, so a fast preset is not held back by a gap sized for a slow one,
-    and a slow preset is not hurried. If the radio cannot be read, the safe
-    default applies.
-    """
-    hint = getattr(link, "gap_hint", None)
-    if hint is not None:
-        return hint
-    seconds = packet_airtime(link)
-    if seconds is None:
-        return SEND_GAP_SECONDS
-    return round(max(MIN_GAP, GAP_AIRTIMES * seconds), 1)
 
 
 def scan():
@@ -144,7 +57,7 @@ def remember_sent(packets):
         _recent.popitem(last = False)
 
 
-def resend(link, group, wanted, gap = None, dest = None, wait_ack = False):
+def resend(link, group, wanted, gap = SEND_GAP_SECONDS, dest = None):
     """Put the named parts of a remembered message back on the air.
 
     Returns how many were resent; 0 means we no longer have that message,
@@ -161,48 +74,18 @@ def resend(link, group, wanted, gap = None, dest = None, wait_ack = False):
             chosen.append(packet)
 
     if chosen:
-        return send_packets(link, chosen, dest = dest, gap = gap, remember = False,
-                            wait_ack = wait_ack)
-    return 0
+        send_packets(link, chosen, dest = dest, gap = gap, remember = False)
+    return len(chosen)
 
 
-# A node heard this recently counts as "the other end". The NodeDB also holds
-# every node ever heard on any channel (yours will list dozens from the public
-# mesh), so age is what separates the radio on your desk from those.
-PEER_MAX_AGE = 600
-
-# A peer learned from a packet we received on our own channel is trusted longer.
-LEARNED_MAX_AGE = 6 * 3600
-
-# Set by the command line (--dest) to pin the peer and skip all guessing.
-default_dest = None
-_learned = {}
-
-DEST_PATTERN = re.compile(r"^!?[0-9a-fA-F]{8}$")
-
-
-def normalize_dest(dest):
-    """'!435C4CE4' or '435c4ce4' -> '!435c4ce4'. Anything else is an error.
-
-    Checked here because the Meshtastic library calls sys.exit() on some bad
-    ids, which would take the whole gateway down with it.
-    """
-    text = str(dest or "").strip()
-    if not DEST_PATTERN.match(text):
-        raise ValueError(f"not a node id: {dest!r} (expected something like !435c4ce4)")
-    return "!" + text.lstrip("!").lower()
-
-
-def peers(link, max_age = None, now = None):
-    """Other nodes this radio has heard, as [(id, name)], sorted by name.
+def peers(link):
+    """Other nodes this radio has heard, as [(id, name)], nearest-known first.
 
     Meshtastic fills interface.nodes in as node-info packets arrive, so this
     grows over the first minute or two after connecting. Our own node is left
-    out: there is no point addressing ourselves. With max_age, nodes not heard
-    from within that many seconds are left out too.
+    out: there is no point addressing ourselves.
     """
     nodes = getattr(link, "nodes", None) or {}
-    now = time.time() if now is None else now
     mine = None
     try:
         mine = link.getMyNodeInfo()["user"]["id"]
@@ -213,255 +96,44 @@ def peers(link, max_age = None, now = None):
     for node_id, node in nodes.items():
         if node_id == mine:
             continue
-        if max_age is not None:
-            heard = node.get("lastHeard")
-            if not heard or now - heard > max_age:
-                continue
         user = node.get("user", {}) or {}
         found.append((node_id, user.get("longName") or user.get("shortName") or node_id))
     return sorted(found, key=lambda pair: pair[1].lower())
 
 
-def only_peer(link, max_age = PEER_MAX_AGE, now = None):
-    """The single other node heard lately, when there is exactly one. Otherwise None.
+def only_peer(link):
+    """The single other node, when there is exactly one. Otherwise None.
 
     On a two-node mesh this is what "dynamic" means in practice: nobody has
     to type an id, and adding a third node makes the choice explicit rather
     than silently picking wrong.
     """
-    found = peers(link, max_age = max_age, now = now)
-    if len(found) != 1:
-        return None
-    try:
-        return normalize_dest(found[0][0])
-    except ValueError:
-        return None
+    found = peers(link)
+    return found[0][0] if len(found) == 1 else None
 
 
-def note_peer(node_id, now = None):
-    """Remember the node a real packet of ours just arrived from."""
-    try:
-        node_id = normalize_dest(node_id)
-    except ValueError:
-        return
-    _learned.update(id = node_id, at = time.time() if now is None else now)
+def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
+    """Send packets in order, pausing between them to limit airtime.
 
-
-def forget_peer():
-    _learned.clear()
-
-
-def pick_dest(link, explicit = None, now = None):
-    """Who to address packets to, or None to broadcast to the channel.
-
-    In order: an id given outright, the id pinned with --dest, the node we last
-    heard one of our own packets from, then the only other node in the NodeDB
-    that was heard recently. Broadcasting makes every other node rebroadcast
-    each packet, so it is only the fallback when none of those is known.
+    A link of None prints instead of transmitting, so the whole pipeline can
+    be exercised without hardware. dest of None broadcasts to the channel.
     """
-    now = time.time() if now is None else now
-    chosen = explicit or default_dest
-    if chosen:
-        return normalize_dest(chosen)
-    if _learned and now - _learned["at"] <= LEARNED_MAX_AGE:
-        return _learned["id"]
-    return only_peer(link, now = now)
-
-
-def _transmit(link, packet, dest, **extra):
-    """One sendData call, addressed to dest or broadcast.
-
-    Only an addressed packet asks for an ack. A broadcast has nobody to
-    acknowledge it, and wantAck on one makes the firmware retransmit it up to
-    three more times while it listens for a rebroadcast that settles nothing.
-    At LONG_FAST that is four 1.9 s transmissions where we intended one, so
-    the channel is busier than our spacing assumes and packets collide. Losing
-    a broadcast is what the resend request exists to repair.
-
-    The library calls sys.exit() on some bad input; that becomes an ordinary
-    error here so a bad packet cannot end the whole program.
-    """
-    try:
-        if dest:
-            return link.sendData(packet, destinationId = dest, wantAck = True, **extra)
-        return link.sendData(packet, **extra)
-    except SystemExit as error:
-        raise RuntimeError(f"the radio refused the packet ({error})") from None
-
-
-# --- sending on acknowledgment ------------------------------------------------
-#
-# A packet addressed to one node is acknowledged by that node's firmware, which
-# also retries it on its own. Waiting for that ack instead of sleeping a fixed
-# time means the next packet goes out the moment the channel is free, and a
-# dead link is noticed within seconds rather than after the whole email.
-
-# How long to wait for an ack, in packet-airtimes. On the 2026-09-20 run the
-# acks that arrived took 5.4 to 6.5 s at LONG_FAST, against 1.9 s of airtime,
-# so 4x covers a healthy ack with room to spare. This was 10x (19 s), and
-# every lost ack then cost 38 s of silence across two tries - long enough that
-# the endpoint gave up waiting and asked again mid-resend.
-ACK_AIRTIMES = 4
-MIN_ACK_WAIT = 4.0
-UNKNOWN_ACK_WAIT = 12.0
-
-# Attempts per packet of our own, on top of the firmware's retries.
-ACK_TRIES = 2
-
-# The pause after an ack before the next packet. The channel is already free.
-ACK_GAP = 0.2
-
-# Waiting for an ack is only worth it for a send this short. Per packet it
-# costs a round trip when it works and a timeout when it does not, and those
-# add up down a train: on 2026-09-20 a four-packet resend that should have
-# taken 8 s took 44 s, and the endpoint gave up waiting and asked again while
-# it was still running, which started the whole thing over. A longer send is
-# paced instead and repaired by the resend request, which is what it is for.
-# A single packet has no train to hold up, so there it is pure gain.
-ACK_TRAIN_LIMIT = 1
-
-
-def ack_timeout(link):
-    """Seconds to wait for one packet's ack on this link before trying again."""
-    hint = getattr(link, "ack_hint", None)
-    if hint is not None:
-        return hint
-    seconds = packet_airtime(link)
-    if seconds is None:
-        return UNKNOWN_ACK_WAIT
-    return max(MIN_ACK_WAIT, ACK_AIRTIMES * seconds)
-
-
-def stamp(moment):
-    """A clock time with milliseconds, e.g. 12:03:41.207, for the timing log."""
-    return time.strftime("%H:%M:%S", time.localtime(moment)) + ".%03d" % int((moment % 1) * 1000)
-
-
-# What each recent message's packets did, keyed by the 2-byte chunk id, so a
-# timing report from the far end can be laid beside our own send and ack times.
-_timelines = OrderedDict()
-
-
-def timeline_for(group):
-    """The send/ack record of a recent message, or None if we no longer have it.
-
-    A list with one entry per packet: part, size, sent_at and acked_at (epoch
-    seconds; acked_at is None if no ack came), outcome and attempts.
-    """
-    return _timelines.get(group)
-
-
-def _send_once(link, packet, dest, timeout, label = ""):
-    """Send one packet and wait for its answer.
-
-    Returns (outcome, sent_at, answered_at). outcome is "NONE" for an ack, the
-    firmware's error name for a NAK (for example "MAX_RETRANSMIT"), or
-    "TIMEOUT" if nothing came back in time; answered_at is when the answer
-    reached us, or None.
-    """
-    answered = threading.Event()
-    outcome, when = [], []
-
-    def on_response(reply):
-        # Called on the radio's own thread. The time is taken here, so it is
-        # when the ack arrived, not when this thread got round to noticing.
-        # Each attempt owns its event, so a late answer to an earlier attempt
-        # cannot be mistaken for this one.
-        moment = time.time()
-        routing = ((reply or {}).get("decoded") or {}).get("routing") or {}
-        outcome.append(routing.get("errorReason", "NONE"))
-        when.append(moment)
-        answered.set()
-
-    sent_at = time.time()
-    _transmit(link, packet, dest, onResponse = on_response, onResponseAckPermitted = True)
-    if label:
-        print("  sent      %s  at %s" % (label, stamp(sent_at)))
-    if not answered.wait(timeout):
-        return "TIMEOUT", sent_at, None
-    return outcome[0], sent_at, when[0]
-
-
-def _send_confirmed(link, packet, dest, tries = ACK_TRIES, label = ""):
-    """Send one packet until it is acknowledged or the tries run out.
-
-    Returns a dict: outcome, sent_at (the first attempt), acked_at, attempts.
-    """
-    first_sent, outcome = None, "TIMEOUT"
-    for attempt in range(1, tries + 1):
-        outcome, sent_at, acked_at = _send_once(link, packet, dest, ack_timeout(link), label)
-        first_sent = first_sent or sent_at
-        if outcome == "NONE":
-            return {"outcome": "NONE", "sent_at": first_sent, "acked_at": acked_at,
-                    "attempts": attempt}
-    return {"outcome": outcome, "sent_at": first_sent, "acked_at": None, "attempts": tries}
-
-
-def send_packets(link, packets, dest=None, gap=None, remember=True, on_sent=None, wait_ack=False):
-    """Send packets in order. Returns how many went out (or were acknowledged).
-
-    dest of None broadcasts to the channel; otherwise it is a node id and only
-    that node is addressed. A link of None prints instead of transmitting, so
-    the whole pipeline can be exercised without hardware.
-
-    wait_ack asks for each packet to be acknowledged before the next goes out,
-    and gives up on the rest if one cannot be delivered. It needs a dest,
-    because a broadcast has nobody to acknowledge it, and it applies only up
-    to ACK_TRAIN_LIMIT packets; a longer send ignores it and is paced instead.
-    Packets not waited for are spaced by gap, which None sets to whatever
-    suits the link (see pace()).
-
-    Every packet's send time is printed, and in ack mode its ack time too. The
-    record is kept (see timeline_for) for comparing with the far end's report.
-
-    on_sent(position, total) is called after each packet that went out.
-    """
-    if dest:
-        dest = normalize_dest(dest)
-    confirm = bool(wait_ack and dest and link is not None
-                   and len(packets) <= ACK_TRAIN_LIMIT)
-    if gap is None:
-        gap = 0 if link is None else (ACK_GAP if confirm else pace(link))
-
     if remember:
         remember_sent(packets)
 
     total = len(packets)
-    done = 0
-    entries = []
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))
-        entry = {"part": position, "size": len(packet), "sent_at": None,
-                 "acked_at": None, "outcome": None, "attempts": 0}
-        entries.append(entry)
         if link is None:
             print("  [dry-run] %s  %s" % (label, packet.hex()))
-        elif confirm:
-            entry.update(_send_confirmed(link, packet, dest, label = label))
-            if entry["outcome"] != "NONE":
-                print("  FAILED    %s  %s; not sending the other %d"
-                      % (label, entry["outcome"], total - position - 1))
-                if _learned.get("id") == dest:
-                    forget_peer()             # do not keep addressing a node that is not answering
-                break
-            print("  acked     %s  by %s at %s  (+%.3f s%s)"
-                  % (label, dest, stamp(entry["acked_at"]), entry["acked_at"] - entry["sent_at"],
-                     "" if entry["attempts"] == 1 else ", after %d tries" % entry["attempts"]))
         else:
-            entry["sent_at"] = time.time()
-            _transmit(link, packet, dest)
-            entry.update(outcome = "SENT", attempts = 1)
-            print("  sent      %s  %s  at %s"
-                  % (label, "to " + dest if dest else "(broadcast)", stamp(entry["sent_at"])))
+            if dest:
+                link.sendData(packet, destinationId=dest, wantAck=True)
+            else:
+                link.sendData(packet, wantAck=True)
+            print("  sent      %s" % label)
 
-        done += 1
-        if on_sent:
-            on_sent(position + 1, total)
         if position < total - 1:
             time.sleep(gap)
 
-    if remember and packets:
-        _timelines[struct.unpack(">H", packets[0][:2])[0]] = entries
-        while len(_timelines) > RECENT_LIMIT:
-            _timelines.popitem(last = False)
-    return done
+    return total
