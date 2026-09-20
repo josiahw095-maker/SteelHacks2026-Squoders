@@ -6,3 +6,5 @@ TODO - SteelHacks2026-Squoders
 - Automatically detect USB Port (COM5 vs. COM6 vs. other)
 
 -Get Bluetooth (Need App First)
+
+-Side Arrows Kill email
