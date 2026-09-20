@@ -136,7 +136,12 @@ def _send_and_wait(link, packet, dest, timeout = ACK_TIMEOUT_SECONDS, tries = AC
             outcome.append(routing.get("errorReason", "NONE"))
             acked.set()
 
-        link.sendData(packet, destinationId = dest, wantAck = True,
+        # hopLimit = 0: nobody may relay this. Meshtastic's "implicit ack" lets
+        # the sender consider a packet delivered the moment ANY nearby node
+        # rebroadcasts it - not necessarily the real destination. With relaying
+        # off, only the true destination can possibly answer, so an ack here
+        # actually means what we think it means.
+        link.sendData(packet, destinationId = dest, wantAck = True, hopLimit = 0,
                      onResponse = on_response, onResponseAckPermitted = True)
         if acked.wait(timeout) and outcome and outcome[0] == "NONE":
             return True
