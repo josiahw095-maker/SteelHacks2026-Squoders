@@ -21,7 +21,9 @@ Message (the bytes that get chunked):
     bit 1  REPLY     this email is itself a reply (its In-Reply-To was set)
     bit 2  OUTBOUND  endpoint -> gateway (a reply being sent) rather than
                      gateway -> endpoint
-    bits 3-7         reserved (use them for a format version if this changes)
+    bit 3  REQUEST   not mail at all: a plea to resend the parts listed in
+                     the body, for the message named in the thread field
+    bits 4-7         reserved (use them for a format version if this changes)
 
     record  <time:   4 bytes, big-endian uint32, UTC minutes since the epoch>
             <thread: 2 bytes, big-endian uint16, crc32 of the Gmail threadId>
@@ -62,18 +64,20 @@ import time
 import zlib
 
 MAX_PAYLOAD = 200   # bytes per mesh packet, conservative (the firmware limit is 233)
-MAX_CHUNKS = 3      # the body is trimmed until the message fits in this many packets
 MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
 MAX_ADDRESS = 100   # bytes; a recipient address is never shortened
 HEADER = 3          # bytes of chunk header (id + part/total)
 MAX_PARTS = 15      # part and total share one byte, 4 bits each
+MAX_CHUNKS = MAX_PARTS  # trim the body only when it will not fit even in a
+                        # full set of packets, which is the header's limit
 RECORD_HEAD = 6     # bytes of record header (4 time + 2 thread)
 ELLIPSIS = "…"  # 3 bytes in UTF-8, marks text that was cut
 
 FLAG_DEFLATE = 0x01
 FLAG_REPLY = 0x02
 FLAG_OUTBOUND = 0x04
+FLAG_REQUEST = 0x08
 
 # Shared compression dictionary. Deflate favors the END of the dictionary, so
 # the most common material goes last. Replace with phrases mined from real mail.
@@ -276,6 +280,55 @@ def compose_packets(address, subject, body):
     return chunk("%s|%s|%d" % (address, subject, minutes), data)
 
 
+def missing_parts(packets):
+    """Which part indices are absent from the packets in hand.
+
+    [] means the set is complete. None means the packets disagree about how
+    many there should be, so there is nothing sensible to ask for.
+    """
+    parts, total = set(), None
+    for packet in packets:
+        _, pt = struct.unpack(">HB", packet[:HEADER])
+        part, claimed = pt >> 4, pt & 0x0F
+        if total is None:
+            total = claimed
+        elif claimed != total:
+            return None
+        parts.add(part)
+
+    if total is None:
+        return None
+    return sorted(set(range(total)) - parts)
+
+
+def request_packets(group_id, wanted):
+    """Ask the far side to resend particular parts of one message.
+
+    The message being chased rides in the thread field, which is the same
+    two bytes as the chunk id, and the wanted parts travel as "0,3,7" in the
+    body. A request is always one packet, so it cannot itself go missing in
+    pieces. Its own chunk id is derived separately so it never collides with
+    the message it is asking about.
+    """
+    group = group_id if isinstance(group_id, int) else short_hash(group_id)
+    data = encode("", "", int(time.time()) // 60, group,
+                  ",".join(str(part) for part in wanted),
+                  FLAG_OUTBOUND | FLAG_REQUEST)
+    return chunk("request-%d" % group, data)
+
+
+def wanted_parts(message):
+    """The part indices a REQUEST message is asking for."""
+    if not message.get("request"):
+        return []
+    out = []
+    for piece in (message.get("body") or "").split(","):
+        piece = piece.strip()
+        if piece.isdigit():
+            out.append(int(piece))
+    return out
+
+
 # --- Inverse: what the endpoint app has to do (kept here as the reference) ---
 
 def reassemble(packets):
@@ -316,6 +369,7 @@ def decode_message(data):
         "thread": thread,
         "reply": bool(flags & FLAG_REPLY),
         "outbound": bool(flags & FLAG_OUTBOUND),
+        "request": bool(flags & FLAG_REQUEST),
         "sender": sender.decode(),
         "subject": subject.decode(),
         "body": body.decode(),

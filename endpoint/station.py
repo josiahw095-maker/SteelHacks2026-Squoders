@@ -19,6 +19,11 @@ import MeshCodec
 # A half-received message is forgotten after this long.
 GROUP_TIMEOUT = 300
 
+# How long a message may stall before we ask for the missing parts, and
+# how many times we are willing to ask.
+REQUEST_AFTER = 20
+MAX_REQUESTS = 3
+
 
 class Station:
     """One connection to the end node, plus everything heard so far."""
@@ -89,6 +94,9 @@ class Station:
             data = MeshCodec.reassemble(group["packets"])
             if data is None:
                 return None
+            # Capture what the delivery cost before the group is discarded.
+            packet_count = len(group["packets"])
+            air_bytes = sum(len(p) for p in group["packets"])
             del self.groups[key]
 
         try:
@@ -100,6 +108,14 @@ class Station:
             return None                      # our own send heard back
 
         message["at"] = time.time()
+        message["packets"] = packet_count
+        message["airbytes"] = air_bytes
+        # What the reader actually got, against what it cost to carry.
+        delivered = len((message["sender"] + message["subject"]
+                         + message["body"]).encode("utf-8"))
+        message["delivered"] = delivered
+        message["ratio"] = (delivered / air_bytes) if air_bytes else 0.0
+
         with self.lock:
             self.messages.append(message)
         return message
@@ -116,6 +132,35 @@ class Station:
             self.Accept(payload)
             arrived += 1
         return arrived
+
+    def Chase(self, now = None):
+        """Ask the gateway to resend the parts of any stalled message.
+
+        A message is stalled when nothing new has arrived for it in
+        REQUEST_AFTER seconds. Each one is chased at most MAX_REQUESTS times
+        so a gateway that has gone away cannot start a loop.
+
+        Returns [(chunk id, missing parts)] for whatever was asked for.
+        """
+        now = now if now is not None else time.time()
+        asks = []
+
+        with self.lock:
+            for key, group in self.groups.items():
+                if now - group["seen"] < REQUEST_AFTER:
+                    continue
+                if group.get("requests", 0) >= MAX_REQUESTS:
+                    continue
+                missing = MeshCodec.missing_parts(group["packets"])
+                if not missing:
+                    continue
+                group["requests"] = group.get("requests", 0) + 1
+                group["seen"] = now          # back off before asking again
+                asks.append((int.from_bytes(key, "big"), missing))
+
+        for group_id, missing in asks:
+            self.Send(MeshCodec.request_packets(group_id, missing))
+        return asks
 
     def Expire(self, now = None):
         """Forget half-received messages that will never complete."""
@@ -146,7 +191,8 @@ class Station:
     def Waiting(self):
         """Half-received messages, as {chunk id: packets so far}."""
         with self.lock:
-            return {key.hex(): len(group["packets"])
+            return {key.hex(): (len(group["packets"]),
+                                group.get("requests", 0))
                     for key, group in self.groups.items()}
 
     def Status(self):
@@ -160,28 +206,45 @@ class Station:
 
     # --- what the UI writes ------------------------------------------------
 
-    def Send(self, packets, gap = 2.0):
-        """Put packets on the air, pausing between them for airtime."""
+    def Send(self, packets, gap = 2.0, on_progress = None):
+        """Put packets on the air, pausing between them for airtime.
+
+        on_progress(sent, total) is called after each packet so a caller can
+        show how far along the send is; a full packet is seconds of airtime,
+        which is long enough to be worth showing.
+        """
+        total = len(packets)
+
+        def report(sent):
+            if on_progress:
+                on_progress(sent, total)
+
         if self.link is None:
-            time.sleep(0.2)                  # demo mode: pretend
-            return len(packets)
+            for position in range(total):     # demo mode: pretend, but pace it
+                time.sleep(0.2)
+                report(position + 1)
+            return total
+
         for position, packet in enumerate(packets):
             self.link.sendData(packet, wantAck = True)
-            if position < len(packets) - 1:
+            report(position + 1)
+            if position < total - 1:
                 time.sleep(gap)
-        return len(packets)
+        return total
 
-    def Reply(self, thread, body):
+    def Reply(self, thread, body, on_progress = None):
         """Reply into a conversation. thread is the 16-bit hash we received."""
-        count = self.Send(MeshCodec.reply_packets(thread, body))
+        count = self.Send(MeshCodec.reply_packets(thread, body),
+                          on_progress = on_progress)
         with self.lock:
             self.sent.append({"kind": "reply", "thread": thread,
                               "body": body, "at": time.time()})
         return count
 
-    def Compose(self, address, subject, body):
+    def Compose(self, address, subject, body, on_progress = None):
         """Send a brand new email, carrying its own recipient."""
-        count = self.Send(MeshCodec.compose_packets(address, subject, body))
+        count = self.Send(MeshCodec.compose_packets(address, subject, body),
+                          on_progress = on_progress)
         with self.lock:
             self.sent.append({"kind": "new", "to": address, "subject": subject,
                               "body": body, "at": time.time()})

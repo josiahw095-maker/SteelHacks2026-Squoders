@@ -39,7 +39,11 @@ The phone does **not** need the channel key. Only the two radios hold it. The en
 | [MessageTransform.py](MessageTransform.py) | Parses a Gmail message into `{id, date, sender, subject, body}`. |
 | [MeshCodec.py](MeshCodec.py) | Packs an email into compressed binary packets and decodes them again, in both directions. Also the format spec for the phone app. |
 | [provision.py](provision.py) | Creates a new private channel and puts it on both nodes. |
-| [RadioTestSend.py](RadioTestSend.py), [RadioTestListen.py](RadioTestListen.py) | Hardware test: send a fake email from one node and receive it on another. |
+| [MessageReply.py](MessageReply.py) | Receives mail composed on the endpoint and sends it through Gmail. |
+| [SentLog.py](SentLog.py) | Remembers what each thread hash stood for, so a reply can be threaded back. |
+| [MeshSend.py](MeshSend.py) | Puts packets on the air, paced for airtime. |
+| [MockRadio.py](MockRadio.py) | Stands in for the radio so the whole chain runs on one machine. |
+| [endpoint/](endpoint) | The inbox: `station.py` talks to the node, `app.py` is the Streamlit screen. |
 | [gmail-start/](gmail-start) | Gmail OAuth helper and its requirements. |
 | [TODO.txt](TODO.txt) | What is done and what is left. |
 
@@ -75,23 +79,43 @@ This generates a random 32-byte key on the first node, copies the channel to the
 
 Add `--name` to choose the channel name (11 bytes or fewer). Nodes on different channel names sit on different frequencies, so all your nodes need the same one.
 
-### 4. Test the radio link
+### 4. Test without a radio
 
-In one terminal, start the receiver on the second node. It prints the node's id, for example `!435c4ce4`:
+`MockRadio.py` replaces the RF hop with a folder, so the whole chain runs on
+one machine. Everything else is real: the same codec, compression, chunking
+and reassembly. Useful when you have one node, no partner, or a flat battery.
 
-```
-python RadioTestListen.py COM5
-```
-
-In another, send a fake email from the first node to that id:
+In one terminal, run the gateway against the mock radio:
 
 ```
-python RadioTestSend.py COM6 !435c4ce4
+python MessagePing.py my-account loopback
 ```
 
-The receiver should print the decoded email within about 30 seconds.
+In another, start the endpoint and pick `loopback` in its sidebar:
 
-### 5. Connect Gmail
+```
+python -m streamlit run endpoint/app.py
+```
+
+Send yourself an email. It should appear in the browser within a few seconds,
+and `spool/down/` will hold one file per packet if you want to look at the
+bytes. Replies and new mail composed in the browser travel back through
+`spool/up/` and are sent through the Gmail API.
+
+### 5. Test over the air
+
+Two nodes, two machines. One machine runs the gateway and needs internet and
+Gmail credentials; the other runs the endpoint and needs neither.
+
+```
+python MessagePing.py my-account COM6              # gateway machine
+python -m streamlit run endpoint/app.py            # endpoint machine, port COM5
+```
+
+The endpoint prints its node id on connect. Both nodes must share a region
+and a channel, or they will not hear each other.
+
+### 6. Connect Gmail
 
 1. In [Google Cloud Console](https://console.cloud.google.com/) create a project, enable the **Gmail API**, configure the OAuth consent screen and add your account as a test user.
 2. Create an OAuth client ID of type **Desktop app** and save the downloaded file as `gmail-start/secrets.json`.
@@ -103,9 +127,17 @@ python MessagePing.py my-account
 
 Every new inbox message is fetched and printed as parsed JSON. Everyone who runs this needs their own Google Cloud project and credentials. `secrets.json` and the `tokens/` folder are git-ignored. Never commit them.
 
-### 6. Pair the phone
+### 7. Read it on a phone
 
-The phone app is not built yet. To pair a phone with the end node, use the Bluetooth PIN shown on the node's screen.
+There is no native app yet. The endpoint serves a web page, so any device on
+the same network can read the inbox: run it on the machine holding the end
+node, then open the Network URL that Streamlit prints, for example
+`http://10.0.0.5:8501`. On Android, Chrome's "Add to Home screen" gives it an
+icon and a full-screen view.
+
+Streamlit binds to every interface. On an open network that means anyone can
+read the inbox and send mail as you, so use `--server.address 127.0.0.1` or a
+private hotspot if that matters.
 
 ## Known issues
 

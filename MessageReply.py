@@ -181,14 +181,37 @@ def SendNew(service, message, dry_run = False):
     return sent.get("id")
 
 
-def Deliver(service, account, message, dry_run = False):
+def Resend(link, message):
+    """Put back on the air the parts a receiver says it never got."""
+    from MeshCodec import wanted_parts
+    from MeshSend import resend
+
+    wanted = wanted_parts(message)
+    if not wanted:
+        return None
+    if link is None:
+        print(f"  [dry-run] would resend parts {wanted} of 0x{message['thread']:04x}")
+        return None
+
+    count = resend(link, message["thread"], wanted)
+    if count:
+        print(f"  resent {count} packet(s) of 0x{message['thread']:04x}")
+    else:
+        print(f"  asked for 0x{message['thread']:04x} but it is no longer cached")
+    return count
+
+
+def Deliver(service, account, message, dry_run = False, link = None):
     """Act on one decoded outbound message, whichever kind it is.
 
-    OUTBOUND with REPLY set is a reply to a thread we remember; OUTBOUND on
-    its own is a new email that carries its own recipient.
+    REQUEST is a plea to resend packets, not mail. OUTBOUND with REPLY set
+    is a reply to a thread we remember; OUTBOUND on its own is a new email
+    that carries its own recipient.
     """
     if not message.get("outbound"):
         return None
+    if message.get("request"):
+        return Resend(link, message)
     if message.get("reply"):
         return SendReply(service, account, message, dry_run)
     return SendNew(service, message, dry_run)

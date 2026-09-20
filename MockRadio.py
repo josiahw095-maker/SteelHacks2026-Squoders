@@ -16,6 +16,7 @@ Use "loopback" wherever a port name is expected:
     ... and pick Loopback in the endpoint sidebar.
 """
 
+import itertools
 import time
 from pathlib import Path
 
@@ -27,6 +28,10 @@ UP = SPOOL / "up"
 KEEP_SECONDS = 120
 
 PORT_NAME = "loopback"
+
+# Two packets written in the same microsecond would otherwise land on the
+# same filename and one would be lost.
+_counter = itertools.count()
 
 
 def IsLoopback(target):
@@ -56,7 +61,7 @@ class LoopbackInterface:
     # --- the bits MeshSend and Station call ------------------------------
 
     def sendData(self, packet, destinationId = None, wantAck = False, **kwargs):
-        name = "%.6f-%d.pkt" % (time.time(), len(packet))
+        name = "%.6f-%06d-%d.pkt" % (time.time(), next(_counter), len(packet))
         (self.send_box / name).write_bytes(bytes(packet))
         return None
 
