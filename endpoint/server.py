@@ -12,14 +12,11 @@ lifted onto a phone later without a build step: point it at a different
 transport and the screen is unchanged.
 """
 
-import hashlib
 import json
 import sys
 import threading
-import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -47,21 +44,7 @@ def SetProgress(**fields):
         progress.update(fields)
 
 
-def Query(path):
-    """The query string of a request path, as {name: first value}."""
-    return {k: v[0] for k, v in parse_qs(urlparse(path).query).items()}
-
-
-# Enumerating serial ports goes through the Windows registry and measured at
-# ~2.3 ms - between 83% and 97% of an /api/state response that is otherwise a
-# fraction of a millisecond. Ports change when somebody plugs a cable in, not
-# every two seconds, so the list is cached and /api/ports forces a rescan.
-OPTIONS_TTL = 5.0
-_options = {"at": 0.0, "value": None}
-_options_lock = threading.Lock()
-
-
-def ScanOptions():
+def Options():
     """Transports the browser can offer: the two fakes, then real ports."""
     options = [
         {"value": "demo", "label": "Demo - sample mail, no radio"},
@@ -78,23 +61,6 @@ def ScanOptions():
     return options
 
 
-def Options(fresh = False):
-    """The transport list, from cache unless it is stale or fresh is asked."""
-    now = time.monotonic()
-    with _options_lock:
-        if not fresh and _options["value"] is not None \
-                and now - _options["at"] < OPTIONS_TTL:
-            return _options["value"]
-
-    # Scanned outside the lock: a slow enumeration should not hold up the
-    # pollers, and the worst a race costs is one extra scan.
-    options = ScanOptions()
-    with _options_lock:
-        _options["value"] = options
-        _options["at"] = time.monotonic()
-    return options
-
-
 def Connect(target):
     """Swap the radio for another one. Returns the new status line."""
     global station
@@ -108,44 +74,19 @@ def Connect(target):
             station = Station(port = target)
         return station.Status()
 
-# The page only ever draws the recent end of the inbox, but Snapshot used to
-# serialize every message every poll: 24 KB of JSON at 50 messages, 225 KB at
-# 500, twice a second while a send was in flight. The totals below still count
-# the whole inbox, so the numbers on screen stay honest.
-#
-# Both caps are needed. MAX_THREADS alone bounds nothing when the mail piles
-# into a handful of long conversations, which is exactly what a reply thread
-# is; MAX_THREAD_MESSAGES bounds the other axis.
-MAX_THREADS = 30
-MAX_THREAD_MESSAGES = 50
-
-
 def Snapshot():
     """Everything the page needs, in one object."""
-    # A plain read of the global: rebinding it in Connect() is atomic, so the
-    # worst this can catch is the station from a moment ago, whereas taking
-    # station_lock would park every poller behind a ten-second Close().
-    station = globals()["station"]
-    if station is None:
-        return {"status": "no radio", "target": current_target, "options": Options(),
-                "node": None, "error": None, "threads": [], "waiting": [],
-                "totals": {"messages": 0, "airbytes": 0, "delivered": 0, "packets": 0},
-                "progress": {"active": False, "sent": 0, "total": 0, "what": ""},
-                "feed": []}
-
     station.Poll()
     station.Chase()
 
     threads = []
-    for thread, messages in station.Threads()[:MAX_THREADS]:
+    for thread, messages in station.Threads():
         newest = messages[-1]
-        shown = messages[-MAX_THREAD_MESSAGES:]
         threads.append({
             "thread": thread,
             "subject": newest["subject"] or "(no subject)",
             "sender": newest["sender"],
             "at": newest["at"],
-            "older": len(messages) - len(shown),
             "messages": [{
                 "sender": m["sender"],
                 "body": m["body"],
@@ -154,7 +95,7 @@ def Snapshot():
                 "airbytes": m["airbytes"],
                 "delivered": m["delivered"],
                 "ratio": round(m["ratio"], 1),
-            } for m in shown],
+            } for m in messages],
         })
 
     inbox = station.Inbox()
@@ -213,27 +154,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/api/state":
-            state = Snapshot()
-            # The radio is quiet most of the time, so most polls would send
-            # back a payload byte for byte identical to the last one. The
-            # page tells us what it already has; if nothing has moved since,
-            # it costs a few dozen bytes instead of up to 225 KB, and the
-            # browser skips redrawing entirely.
-            raw = json.dumps(state).encode()
-            version = hashlib.blake2b(raw, digest_size = 8).hexdigest()
-            state["v"] = version
-            if Query(self.path).get("v") == version:
-                return self.Reply(200, {"unchanged": True, "v": version})
-            return self.Reply(200, state)
-        if path == "/api/progress":
-            # Polled several times a second while a send is on the air. It
-            # answers with a few dozen bytes and touches neither the radio
-            # nor the inbox, which is the whole point of it existing.
-            with progress_lock:
-                return self.Reply(200, dict(progress))
+            return self.Reply(200, Snapshot())
         if path == "/api/ports":
-            return self.Reply(200, {"options": Options(fresh = True),
-                                    "target": current_target})
+            return self.Reply(200, {"options": Options(), "target": current_target})
 
         name = "index.html" if path == "/" else path.lstrip("/")
         target = (WEB / name).resolve()

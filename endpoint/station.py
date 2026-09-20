@@ -35,11 +35,6 @@ MAX_EVENTS = 200
 DONE_WINDOW = 45
 MAX_DONE = 60
 
-# The inbox is what the endpoint serializes on every poll, so it does not get
-# to grow forever. Far more than a demo will ever reach; it is a backstop, not
-# a policy.
-MAX_MESSAGES = 500
-
 
 class Station:
     """One connection to the end node, plus everything heard so far."""
@@ -48,11 +43,6 @@ class Station:
         self.port = port
         self.mock = mock
         self.lock = threading.Lock()
-        # Held for the length of a whole send. Chase() runs on whichever
-        # thread happened to poll, a reply runs on the request thread, and
-        # two of them calling sendData at once interleaves two messages on
-        # the air. This is the radio, not the bookkeeping: never hold both.
-        self.send_lock = threading.Lock()
         self.messages = []          # decoded inbound mail, oldest first
         self.groups = {}            # packets still waiting for their siblings
         self.sent = []              # what we pushed back, for the UI to show
@@ -133,11 +123,8 @@ class Station:
             now = time.time()
             self.done[key] = now
             if len(self.done) > MAX_DONE:
-                # Oldest first, rather than expired-only: a burst of fresh ids
-                # has nothing expired in it, so filtering on DONE_WINDOW alone
-                # would drop nothing and let the dict grow past its cap.
-                for stale in sorted(self.done, key = self.done.get)[
-                        :len(self.done) - MAX_DONE]:
+                for stale in [k for k, t in self.done.items()
+                              if now - t > DONE_WINDOW][:len(self.done) - MAX_DONE]:
                     del self.done[stale]
 
         try:
@@ -160,8 +147,6 @@ class Station:
 
         with self.lock:
             self.messages.append(message)
-            if len(self.messages) > MAX_MESSAGES:
-                del self.messages[:len(self.messages) - MAX_MESSAGES]
         return message
 
     def Note(self, kind, text, bytes_ = 0):
@@ -205,8 +190,6 @@ class Station:
         """Pull packets in when there is no callback (the mock radio).
 
         Safe to call always: with a real radio there is nothing to pull.
-        The loopback interface sweeps its own spool from Receive(), so the
-        folder this reads does not grow for the length of the demo.
         """
         if not hasattr(self.link, "Receive"):
             return 0
@@ -239,27 +222,12 @@ class Station:
                     continue
                 group["requests"] = group.get("requests", 0) + 1
                 group["seen"] = now          # back off before asking again
-                asks.append((int.from_bytes(key, "big"), missing, key))
+                asks.append((int.from_bytes(key, "big"), missing))
 
-        sent = []
-        for group_id, missing, key in asks:
-            # wait = False: this runs on a polling thread, and blocking it
-            # behind a reply that is mid-air would stall the whole page.
-            if self.Send(MeshCodec.request_packets(group_id, missing),
-                         wait = False) is None:
-                with self.lock:
-                    group = self.groups.get(key)
-                    if group:
-                        # Hand the attempt back. It was never asked for, so
-                        # it should not count against MAX_REQUESTS, and the
-                        # next sweep should pick it up rather than wait out
-                        # another REQUEST_AFTER.
-                        group["requests"] = max(0, group.get("requests", 1) - 1)
-                        group["seen"] = 0.0
-                continue
+        for group_id, missing in asks:
             self.Note("ask", f"asked for parts {missing} of {group_id:04x}")
-            sent.append((group_id, missing))
-        return sent
+            self.Send(MeshCodec.request_packets(group_id, missing))
+        return asks
 
     def Expire(self, now = None):
         """Forget half-received messages that will never complete."""
@@ -305,42 +273,32 @@ class Station:
 
     # --- what the UI writes ------------------------------------------------
 
-    def Send(self, packets, gap = 2.0, on_progress = None, wait = True):
+    def Send(self, packets, gap = 2.0, on_progress = None):
         """Put packets on the air, pausing between them for airtime.
 
         on_progress(sent, total) is called after each packet so a caller can
         show how far along the send is; a full packet is seconds of airtime,
         which is long enough to be worth showing.
-
-        wait = False returns None straight away when the radio is already
-        busy, instead of queueing behind a send that may run for half a
-        minute. That is what Chase wants: a resend request it cannot put out
-        now is asked for again on the next sweep anyway.
         """
-        if not self.send_lock.acquire(blocking = wait):
-            return None
-        try:
-            total = len(packets)
+        total = len(packets)
 
-            def report(sent):
-                if on_progress:
-                    on_progress(sent, total)
+        def report(sent):
+            if on_progress:
+                on_progress(sent, total)
 
-            if self.link is None:
-                for position in range(total):  # demo mode: pretend, but pace it
-                    time.sleep(0.2)
-                    report(position + 1)
-                return total
-
-            for position, packet in enumerate(packets):
-                self.link.sendData(packet, wantAck = True)
-                self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
+        if self.link is None:
+            for position in range(total):     # demo mode: pretend, but pace it
+                time.sleep(0.2)
                 report(position + 1)
-                if position < total - 1:
-                    time.sleep(gap)
             return total
-        finally:
-            self.send_lock.release()
+
+        for position, packet in enumerate(packets):
+            self.link.sendData(packet, wantAck = True)
+            self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
+            report(position + 1)
+            if position < total - 1:
+                time.sleep(gap)
+        return total
 
     def Reply(self, thread, body, on_progress = None):
         """Reply into a conversation. thread is the 16-bit hash we received."""

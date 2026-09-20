@@ -25,7 +25,7 @@ from MessageTransform import transform
 from MeshCodec import to_packets, short_hash
 from SentLog import Remember
 from MessageReply import Listen, Drain, Expire, Deliver, Collect
-from MeshSend import open_link, queue_packets, start_sender, drain, pending
+from MeshSend import open_link, send_packets
 
 POLL_SECONDS = 2
 
@@ -133,11 +133,6 @@ if __name__ == "__main__":
         link = open_link(target)
         if not hasattr(link, "Receive"):
             Listen()
-        # Packets go out on their own thread from here on. The airtime gap is
-        # unchanged - it is still one packet every SEND_GAP_SECONDS - but this
-        # loop no longer sits inside it, so Gmail keeps being polled and
-        # replies keep being answered while an email is going out.
-        start_sender(link)
         print("Connected to the gateway node. Listening for replies.")
 
     history_id = LoadHistoryId(account)
@@ -173,12 +168,9 @@ if __name__ == "__main__":
                 packets = to_packets(email)
                 print("")
                 print(f"{email['sender']}: {email['subject']}  ->  {len(packets)} packet(s)")
-                # Recorded BEFORE the send rather than after it: the packets
-                # now go out on another thread, and a reply to this email can
-                # land while they are still on the air. It has to find the
-                # thread hash already logged or it cannot be threaded back.
+                send_packets(link, packets)
+                # so a reply carrying this thread hash can be threaded back
                 Remember(account, short_hash(email["thread"] or email["id"]), email)
-                queue_packets(link, packets)
 
             # Saved only after the batch is sent, so a crash re-sends rather
             # than silently skipping mail.
@@ -207,11 +199,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Stopping.")
     finally:
-        # Queued packets are real mail that has not left yet, so give the
-        # sender a chance to finish rather than dropping them on the floor.
-        if pending():
-            print(f"Finishing {pending()} queued message(s); Ctrl + C again to abandon.")
-            drain()
         if link is not None:
             # BLEInterface.close() can wait forever on Windows (see TODO), so
             # give the disconnect 10 seconds and then leave it behind.
