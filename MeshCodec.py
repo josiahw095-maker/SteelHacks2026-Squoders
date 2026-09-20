@@ -63,7 +63,7 @@ import struct
 import time
 import zlib
 
-MAX_PAYLOAD = 200   # bytes per mesh packet, conservative (the firmware limit is 233)
+MAX_PAYLOAD = 160   # bytes per mesh packet, conservative (the firmware limit is 233)
 MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
 MAX_ADDRESS = 100   # bytes; a recipient address is never shortened

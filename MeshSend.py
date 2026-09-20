@@ -128,11 +128,8 @@ def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
             print("  [dry-run] %s  %s" % (label, packet.hex()))
         else:
             if dest:
-                link.sendData(packet, destinationId=dest, wantAck=True)
+                link.sendData(packet, destinationId=dest)
             else:
-                # Nobody can ack a broadcast. Asking anyway makes the firmware
-                # retransmit it up to three more times on its own, which
-                # collides with our own steady pacing on an already busy channel.
                 link.sendData(packet)
             print("  sent      %s" % label)
 

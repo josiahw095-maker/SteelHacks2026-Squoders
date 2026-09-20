@@ -64,7 +64,7 @@ class LoopbackInterface:
 
     # --- the bits MeshSend and Station call ------------------------------
 
-    def sendData(self, packet, destinationId = None, wantAck = False, **kwargs):
+    def sendData(self, packet, destinationId = None, **kwargs):
         name = "%.6f-%06d-%d.pkt" % (time.time(), next(_counter), len(packet))
         (self.send_box / name).write_bytes(bytes(packet))
         return None
