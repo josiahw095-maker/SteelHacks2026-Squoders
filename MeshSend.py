@@ -7,11 +7,13 @@ The packets are raw bytes, so they go out with sendData on the private port
 (PortNum.PRIVATE_APP, the library default), never sendText.
 """
 
+import struct
 import time
+from collections import OrderedDict
 
 # Courtesy gap between packets. A full 200-byte packet is roughly 2 s of
 # airtime at LONG_FAST, and every hop rebroadcasts what it hears.
-SEND_GAP_SECONDS = 5.0
+SEND_GAP_SECONDS = 2.0
 
 
 def scan():
@@ -39,12 +41,86 @@ def open_link(target=None):
     return BLEInterface(target)
 
 
-def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS):
+# What we have sent lately, so a lost packet can be replayed instead of the
+# whole email being resent. Keyed by the 2-byte chunk id the receiver quotes.
+RECENT_LIMIT = 30
+_recent = OrderedDict()
+
+
+def remember_sent(packets):
+    """Keep a copy of an outgoing message, for possible resend."""
+    if not packets:
+        return
+    group, _ = struct.unpack(">HB", packets[0][:3])
+    _recent[group] = list(packets)
+    while len(_recent) > RECENT_LIMIT:
+        _recent.popitem(last = False)
+
+
+def resend(link, group, wanted, gap = SEND_GAP_SECONDS, dest = None):
+    """Put the named parts of a remembered message back on the air.
+
+    Returns how many were resent; 0 means we no longer have that message,
+    which is the honest answer rather than a silent failure.
+    """
+    packets = _recent.get(group)
+    if not packets:
+        return 0
+
+    chosen = []
+    for packet in packets:
+        _, pt = struct.unpack(">HB", packet[:3])
+        if (pt >> 4) in wanted:
+            chosen.append(packet)
+
+    if chosen:
+        send_packets(link, chosen, dest = dest, gap = gap, remember = False)
+    return len(chosen)
+
+
+def peers(link):
+    """Other nodes this radio has heard, as [(id, name)], nearest-known first.
+
+    Meshtastic fills interface.nodes in as node-info packets arrive, so this
+    grows over the first minute or two after connecting. Our own node is left
+    out: there is no point addressing ourselves.
+    """
+    nodes = getattr(link, "nodes", None) or {}
+    mine = None
+    try:
+        mine = link.getMyNodeInfo()["user"]["id"]
+    except Exception:
+        pass
+
+    found = []
+    for node_id, node in nodes.items():
+        if node_id == mine:
+            continue
+        user = node.get("user", {}) or {}
+        found.append((node_id, user.get("longName") or user.get("shortName") or node_id))
+    return sorted(found, key=lambda pair: pair[1].lower())
+
+
+def only_peer(link):
+    """The single other node, when there is exactly one. Otherwise None.
+
+    On a two-node mesh this is what "dynamic" means in practice: nobody has
+    to type an id, and adding a third node makes the choice explicit rather
+    than silently picking wrong.
+    """
+    found = peers(link)
+    return found[0][0] if len(found) == 1 else None
+
+
+def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
     """Send packets in order, pausing between them to limit airtime.
 
     A link of None prints instead of transmitting, so the whole pipeline can
     be exercised without hardware. dest of None broadcasts to the channel.
     """
+    if remember:
+        remember_sent(packets)
+
     total = len(packets)
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))

@@ -187,10 +187,12 @@ if __name__ == "__main__":
             Expire()
             for reply in Drain():
                 print("")
-                kind = "reply" if reply["reply"] else "new email"
+                kind = ("resend request" if reply["request"]
+                        else "reply" if reply["reply"] else "new email")
                 print(f"{kind} from the endpoint: {reply['body'][:60]!r}")
                 try:
-                    Deliver(service, account, reply, dry_run = link is None)
+                    Deliver(service, account, reply, dry_run = link is None,
+                            link = link)
                 except HttpError as error:
                     print(f"  Gmail refused the reply: {error}")
             time.sleep(POLL_SECONDS)

@@ -32,6 +32,22 @@ def WhenText(stamp):
     return time.strftime("%H:%M", time.localtime(stamp))
 
 
+def SendWithBar(slot, label, action):
+    """Run a send, drawing how many packets have gone out so far.
+
+    A full packet is seconds of airtime, so this is real progress, not a
+    decorative spinner.
+    """
+    bar = slot.progress(0.0, text = f"{label}...")
+
+    def Tick(sent, total):
+        bar.progress(sent / total, text = f"{label}  -  packet {sent} of {total}")
+
+    count = action(Tick)
+    bar.progress(1.0, text = f"{label}  -  {count} packet(s) away")
+    return count
+
+
 # --- sidebar: the connection ------------------------------------------------
 
 with st.sidebar:
@@ -49,11 +65,19 @@ with st.sidebar:
         st.error(station.error)
         st.caption("Close anything else holding the port, then rerun.")
 
+    inbox = station.Inbox()
+    if inbox:
+        air = sum(m["airbytes"] for m in inbox)
+        got = sum(m["delivered"] for m in inbox)
+        st.metric("Carried over LoRa", f"{air} B",
+                  delta = f"{got} B delivered", delta_color = "off")
+
     waiting = station.Waiting()
     if waiting:
         st.warning(f"{len(waiting)} message(s) still arriving")
-        for chunk_id, count in waiting.items():
-            st.caption(f"  {chunk_id}: {count} packet(s) so far")
+        for chunk_id, (count, asks) in waiting.items():
+            chased = f", asked {asks}x" if asks else ""
+            st.caption(f"  {chunk_id}: {count} packet(s) so far{chased}")
 
     st.divider()
     st.header("New email")
@@ -67,8 +91,9 @@ with st.sidebar:
             elif not body.strip():
                 st.error("Nothing to send.")
             else:
-                sent = station.Compose(to, subject, body)
-                st.success(f"Sent in {sent} packet(s).")
+                SendWithBar(st, "Sending",
+                            lambda tick: station.Compose(to, subject, body,
+                                                         on_progress = tick))
 
 
 # --- main: the inbox --------------------------------------------------------
@@ -80,6 +105,7 @@ st.caption("Email carried over LoRa. No cellular, no Wi-Fi at this end.")
 @st.fragment(run_every = 2)
 def Inbox():
     station.Poll()          # no-op with a real radio; pulls the spool otherwise
+    station.Chase()         # ask for anything that has stalled
     threads = station.Threads()
     if not threads:
         st.info("Nothing yet. Mail appears here as the radio receives it.")
@@ -92,6 +118,11 @@ def Inbox():
             for message in messages:
                 st.markdown(f"**{message['sender']}** &nbsp; `{WhenText(message['at'])}`")
                 st.write(message["body"])
+                st.caption(
+                    f"{message['packets']} packet(s) &nbsp;|&nbsp; "
+                    f"{message['airbytes']} bytes on air &nbsp;|&nbsp; "
+                    f"{message['delivered']} bytes delivered &nbsp;|&nbsp; "
+                    f"{message['ratio']:.1f}x", unsafe_allow_html = True)
                 st.divider()
 
             with st.form(f"reply-{thread}", clear_on_submit = True):
@@ -100,8 +131,9 @@ def Inbox():
                                       placeholder = "Write a reply...")
                 if st.form_submit_button("Send reply"):
                     if answer.strip():
-                        count = station.Reply(thread, answer)
-                        st.success(f"Reply sent in {count} packet(s).")
+                        SendWithBar(st, "Sending reply",
+                                    lambda tick: station.Reply(thread, answer,
+                                                               on_progress = tick))
                     else:
                         st.error("Nothing to send.")
 

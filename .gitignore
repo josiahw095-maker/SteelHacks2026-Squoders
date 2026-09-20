@@ -230,3 +230,6 @@ secrets.json
 token.json
 token_*.json
 tokens/
+
+# Mock radio packet spool - transient, never commit
+spool/
