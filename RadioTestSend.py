@@ -2,6 +2,8 @@
 
     python RadioTestSend.py Meshtastic_23c0 !abcd1234
     python RadioTestSend.py COM6 !abcd1234          (USB serial, more reliable)
+    python RadioTestSend.py COM6 !abcd1234 --reply  (send a reply the other way)
+    python RadioTestSend.py COM6 !abcd1234 --compose (send a brand new email)
 
 The first argument is the sending node's Bluetooth name or COM port, the second is the node id
 that RadioTestListen.py printed. Sends a fake email through the real pipeline:
@@ -27,6 +29,12 @@ BODY = (
     "shared folder. Let me know if I missed anything.\nThanks,\nJordan"
 )
 
+COMPOSE_TO = "josiahw095@gmail.com"
+COMPOSE_SUBJECT = "Sent from the mesh"
+COMPOSE_TEXT = "Composed on the endpoint with no internet in sight."
+
+REPLY_TEXT = "Noon works for me, see you at the cafe. I will bring the notes."
+
 FAKE_EMAIL = {
     "id": "18c0ffee1234abcd",
     "internalDate": str(int(time.time() * 1000)),
@@ -42,7 +50,18 @@ FAKE_EMAIL = {
 
 if __name__ == "__main__":
     ble_name, dest = sys.argv[1], sys.argv[2]
-    packets = MeshCodec.to_packets(transform(FAKE_EMAIL))
+    if "--compose" in sys.argv:
+        # endpoint -> gateway: a brand new email, carrying its own recipient
+        packets = MeshCodec.compose_packets(COMPOSE_TO, COMPOSE_SUBJECT, COMPOSE_TEXT)
+        print("direction: NEW EMAIL (endpoint -> gateway)")
+    elif "--reply" in sys.argv:
+        # endpoint -> gateway: what the phone app will send when you hit reply
+        packets = MeshCodec.reply_packets(FAKE_EMAIL["id"], REPLY_TEXT)
+        print("direction: REPLY (endpoint -> gateway)")
+    else:
+        # gateway -> endpoint: a new email arriving
+        packets = MeshCodec.to_packets(transform(FAKE_EMAIL))
+        print("direction: EMAIL (gateway -> endpoint)")
     print(f"{len(packets)} packet(s): {[len(p) for p in packets]} bytes")
 
     if ble_name.upper().startswith("COM") or ble_name.startswith("/dev/"):

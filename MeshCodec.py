@@ -32,6 +32,10 @@ split(b"\n", 2). The body comes last and may contain newlines. An outbound
 reply leaves sender and subject empty: the gateway already holds the address,
 the Message-ID and the thread, and builds the real email from those.
 
+For OUTBOUND messages the sender slot means "the other party", so a new email
+(OUTBOUND set, REPLY clear) carries its RECIPIENT there and its subject in the
+subject slot. OUTBOUND with REPLY set is a reply and uses thread instead.
+
 thread groups a conversation; the 2-byte id in the chunk header groups the
 packets of one message. For the first mail in a thread the two are equal.
 
@@ -40,8 +44,10 @@ Chunk (each mesh packet, at most MAX_PAYLOAD bytes):
     <id: 2 bytes> <part<<4 | total: 1 byte> <slice of the message>
 
     id      crc32 of the Gmail message id, low 16 bits; groups the packets
-    part    0-based index of this packet
-    total   number of packets (1..15)
+    part    0-based INDEX of this packet   (0 .. total-1)
+    total   1-based COUNT of packets        (1 .. MAX_PARTS)
+            The two use different conventions but share one byte, so
+            packet 2 of 3 is part=1, total=3, i.e. the byte 0x13.
 
 Text is shortened BEFORE it is compressed, and the message is compressed BEFORE
 it is split. Dropping packets from the end of a compressed stream would make it
@@ -59,7 +65,9 @@ MAX_PAYLOAD = 200   # bytes per mesh packet, conservative (the firmware limit is
 MAX_CHUNKS = 3      # the body is trimmed until the message fits in this many packets
 MAX_SENDER = 20     # bytes
 MAX_SUBJECT = 40    # bytes
+MAX_ADDRESS = 100   # bytes; a recipient address is never shortened
 HEADER = 3          # bytes of chunk header (id + part/total)
+MAX_PARTS = 15      # part and total share one byte, 4 bits each
 RECORD_HEAD = 6     # bytes of record header (4 time + 2 thread)
 ELLIPSIS = "…"  # 3 bytes in UTF-8, marks text that was cut
 
@@ -189,9 +197,14 @@ def inflate(data):
 
 
 def pack(sender, subject, minutes, thread, body, flags):
-    """flag byte + (raw or deflated) record; whichever is smaller."""
+    """flag byte + (raw or deflated) record; whichever is smaller.
+
+    sender and subject go through one_line() here rather than at the call
+    site: a newline in either would move the split in decode_message() and
+    silently corrupt both the subject and the body.
+    """
     record = struct.pack(">IH", minutes, thread) + b"\n".join(
-        (sender.encode(), subject.encode(), body.encode()))
+        (one_line(sender).encode(), one_line(subject).encode(), body.encode()))
     packed = deflate(record)
     if len(packed) < len(record):
         return bytes([flags | FLAG_DEFLATE]) + packed
@@ -215,6 +228,9 @@ def chunk(group_id, data):
     header described at the top of the file."""
     room = MAX_PAYLOAD - HEADER
     pieces = [data[i:i + room] for i in range(0, len(data), room)]
+    if len(pieces) > MAX_PARTS:
+        raise ValueError("%d pieces, but the header holds at most %d"
+                         % (len(pieces), MAX_PARTS))
     mid = short_hash(group_id)
     return [struct.pack(">HB", mid, i << 4 | len(pieces)) + piece
             for i, piece in enumerate(pieces)]
@@ -243,16 +259,45 @@ def reply_packets(thread_id, body, message_id=""):
     return chunk(message_id or thread_id, data)
 
 
+def compose_packets(address, subject, body):
+    """A brand new email heading endpoint -> gateway.
+
+    OUTBOUND without REPLY means "compose", so the gateway reads the
+    recipient out of the sender slot instead of looking a thread up. The
+    address is not run through shorten(): a truncated address is not an
+    address, so it is capped at MAX_ADDRESS and otherwise left whole.
+    """
+    minutes = int(time.time()) // 60
+    address = truncate_bytes(one_line(address), MAX_ADDRESS)
+    subject = shorten(one_line(subject), MAX_SUBJECT)
+    data = encode(address, subject, minutes, 0, one_line(body), FLAG_OUTBOUND)
+    return chunk("%s|%s|%d" % (address, subject, minutes), data)
+
+
 # --- Inverse: what the endpoint app has to do (kept here as the reference) ---
 
 def reassemble(packets):
-    """Packets of ONE message, any order -> the message bytes, or None if any
-    packet is missing. The app should group packets by their 2-byte id first."""
+    """Packets of ONE message, any order -> the message bytes, or None.
+
+    None means the set is not usable: a packet is missing, the packets
+    disagree about how many there are, or one claims a part outside that
+    range. Disagreement means at least one packet is corrupt, so we refuse
+    rather than guess. The app should group packets by their 2-byte id first.
+    """
     parts, total = {}, None
     for packet in packets:
         _, pt = struct.unpack(">HB", packet[:HEADER])
-        parts[pt >> 4] = packet[HEADER:]
-        total = pt & 0x0F
+        part, claimed = pt >> 4, pt & 0x0F
+
+        if total is None:
+            total = claimed
+        elif claimed != total:
+            return None
+        if part >= total:
+            return None
+
+        parts[part] = packet[HEADER:]
+
     if total is None or len(parts) != total:
         return None
     return b"".join(parts[i] for i in range(total))

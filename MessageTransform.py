@@ -132,6 +132,8 @@ def transform(message):
         "subject": decode_mime_words(get_header(message, "Subject")),
         "thread": message.get("threadId", ""),
         "reply": bool(get_header(message, "In-Reply-To")),
+        "address": parseaddr(get_header(message, "From"))[1],
+        "rfc_id": get_header(message, "Message-ID"),
         "body": strip_quotes(body),
                            
     }
