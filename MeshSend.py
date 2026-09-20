@@ -134,14 +134,12 @@ def _send_and_wait(link, packet, dest, timeout = ACK_TIMEOUT_SECONDS, tries = AC
             # Called on the radio's own thread once the ack (or nak) arrives.
             routing = ((reply or {}).get("decoded") or {}).get("routing") or {}
             outcome.append(routing.get("errorReason", "NONE"))
+            # Who actually answered - worth knowing if a packet is later found
+            # missing at the real destination despite a clean ack here.
+            print("  ack from  %s: %s" % ((reply or {}).get("fromId"), outcome[-1]))
             acked.set()
 
-        # hopLimit = 0: nobody may relay this. Meshtastic's "implicit ack" lets
-        # the sender consider a packet delivered the moment ANY nearby node
-        # rebroadcasts it - not necessarily the real destination. With relaying
-        # off, only the true destination can possibly answer, so an ack here
-        # actually means what we think it means.
-        link.sendData(packet, destinationId = dest, wantAck = True, hopLimit = 0,
+        link.sendData(packet, destinationId = dest, wantAck = True,
                      onResponse = on_response, onResponseAckPermitted = True)
         if acked.wait(timeout) and outcome and outcome[0] == "NONE":
             return True
