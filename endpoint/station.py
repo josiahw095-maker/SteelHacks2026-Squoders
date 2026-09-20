@@ -85,6 +85,7 @@ class Station:
                 self.link = BLEInterface(self.port)
 
             self.node_id = self.link.getMyNodeInfo()["user"]["id"]
+            MeshSend.read_preset(self.link)   # airtime, and so pacing, depend on it
             pub.subscribe(self.OnReceive, "meshtastic.receive")
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
@@ -329,14 +330,25 @@ class Station:
                 return total
 
             for position, packet in enumerate(packets):
+                # A radio holding packets it has not transmitted cannot be
+                # helped by another one, and at zero free slots sendData()
+                # blocks forever inside the library - which would take this
+                # request thread, and the send_lock, down with it.
+                if MeshSend.queue_backed_up(self.link):
+                    self.Note("tx", f"STOPPED at packet {position + 1}/{total}"
+                                    f" - the radio is holding packets it has"
+                                    f" not transmitted; the channel is saturated")
+                    return position
+
                 self.link.sendData(packet)
                 report(position + 1)      # the bar moves on the handover...
-                waited, gave_up = MeshSend.wait_for_clear_queue(self.link)
-                # ...and the feed line lands when the radio says the packet
-                # is really gone, with what that took.
+                waited, timed_out = MeshSend.pace_after(self.link, len(packet))
+                # ...and the feed line lands once we have waited out this
+                # packet's share of the air, with what that took.
                 self.Note("tx", f"packet out ({position + 1}/{total})"
-                                f" - queue clear in {waited:.2f} s"
-                                + (" - GAVE UP" if gave_up else ""), len(packet))
+                                f" - {waited:.2f} s"
+                                + (" - queue never reported empty" if timed_out
+                                   else ""), len(packet))
             return total
 
     def Reply(self, thread, body, on_progress = None):

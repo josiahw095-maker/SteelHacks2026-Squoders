@@ -20,6 +20,8 @@ import time
 import meshtastic.serial_interface
 from meshtastic.protobuf import config_pb2
 
+from MeshSend import PRESET_RADIO, airtime_seconds
+
 URL_FILE = "channel.url"
 BACKUP_FILE = "channel.backup.url"
 DEFAULT_PSK = b"\x01"
@@ -32,16 +34,42 @@ NEVER_SECONDS = 0xFFFFFFFF
 
 
 def Quiet(iface):
-    """Stop a node announcing itself on its own schedule.
+    """Stop a node announcing itself, and stop it repeating what it hears.
 
     Our own data packets are all this mesh should be carrying - not periodic
     NodeInfo or Position broadcasts nobody asked for, which just compete with
     them for airtime.
+
+    Rebroadcast is the expensive one. With two nodes in one room, every
+    packet either of them sends is repeated by the other for nobody's
+    benefit, so the channel carries each one twice. Measured on this mesh at
+    LONG_FAST: a 200-byte packet is ~1.9 s of airtime, one every 4 s put the
+    gateway alone at 47% of the channel, and the echo took it to ~93%. Past
+    that point neither radio can find a clear moment to transmit, the TX
+    queue fills with packets that never go out, and sending stops working.
+    NONE means this node forwards nothing; it does not affect its own sends.
     """
-    iface.localNode.localConfig.device.node_info_broadcast_secs = NEVER_SECONDS
+    device = iface.localNode.localConfig.device
+    device.node_info_broadcast_secs = NEVER_SECONDS
+    device.rebroadcast_mode = config_pb2.Config.DeviceConfig.RebroadcastMode.NONE
     iface.localNode.writeConfig("device")
     iface.localNode.localConfig.position.position_broadcast_secs = NEVER_SECONDS
     iface.localNode.writeConfig("position")
+
+
+def SetPreset(iface, name):
+    """Put a node on a modem preset. This is the biggest lever there is.
+
+    The preset sets the spreading factor, and airtime is exponential in it:
+    the same 200-byte packet is ~1.9 s on LONG_FAST and ~0.18 s on
+    SHORT_FAST. Range for airtime is a real trade, but two nodes on a desk
+    are paying for range they are not using, and paying in the one currency
+    this mesh runs out of.
+    """
+    lora = iface.localNode.localConfig.lora
+    lora.use_preset = True
+    lora.modem_preset = config_pb2.Config.LoRaConfig.ModemPreset.Value(name)
+    iface.localNode.writeConfig("lora")
 
 
 def Connect(port, tries=12):
@@ -69,6 +97,11 @@ def Main():
     parser.add_argument("port_b", help="node that receives the channel, e.g. COM5")
     parser.add_argument("--name", default="SquodersNet", help="channel name (max 11 chars)")
     parser.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    parser.add_argument("--preset", choices=sorted(PRESET_RADIO),
+                        help="modem preset for both nodes. Left alone by "
+                             "default. A full 200-byte packet costs "
+                             + ", ".join("%s %.2fs" % (name, airtime_seconds(216, name))
+                                         for name in ("LONG_FAST", "MEDIUM_FAST", "SHORT_FAST")))
     args = parser.parse_args()
     if len(args.name.encode()) > 11:
         sys.exit("channel name must be 11 bytes or fewer")
@@ -101,9 +134,15 @@ def Main():
         f.write(url + "\n")
     print(f"new channel '{args.name}' applied to both nodes; URL saved to {URL_FILE} (not shown)")
 
+    if args.preset:
+        for iface in (a, b):
+            SetPreset(iface, args.preset)
+        print(f"both nodes set to modem preset {args.preset} "
+              f"({airtime_seconds(216, args.preset):.2f} s per full packet)")
+
     Quiet(a)
     Quiet(b)
-    print("nodeinfo and position broadcasts disabled on both nodes")
+    print("nodeinfo, position and rebroadcast disabled on both nodes")
 
     time.sleep(3)
     a.close()

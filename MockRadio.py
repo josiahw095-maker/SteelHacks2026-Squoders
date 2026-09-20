@@ -39,10 +39,8 @@ class _EmptyQueue:
     """Enough of meshtastic's QueueStatus for MeshSend to pace against.
 
     A folder has no airtime and no shared medium, so this side's TX queue is
-    always empty. Without it MeshSend sees no queueStatus at all, decides the
-    firmware is too old to report one, and falls back to sleeping
-    SEND_GAP_SECONDS per packet - four seconds each, a minute for a full
-    email, waiting on a radio that is not there.
+    always empty and MeshSend never has to wait on it. See no_airtime on
+    LoopbackInterface for the other half of that.
     """
     free = 1
     maxlen = 1
@@ -63,6 +61,12 @@ class LoopbackInterface:
     direction is which folder this side SENDS into: the gateway sends "down",
     the endpoint sends "up".
     """
+
+    # There is no channel to share and nothing to be polite to, so MeshSend
+    # skips its airtime gap entirely here. Without this the spool would be
+    # paced as if it were LoRa - 16.8 s a packet at the default preset, four
+    # minutes for an email that never touches a radio.
+    no_airtime = True
 
     def __init__(self, direction = "down", node_id = "!loopback"):
         self.direction = direction
