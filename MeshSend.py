@@ -9,7 +9,6 @@ The packets are raw bytes, so they go out with sendData on the private port
 
 import struct
 import threading
-import time
 from collections import OrderedDict
 
 # Courtesy gap between packets. A full 200-byte packet is roughly 2 s of
@@ -150,41 +149,42 @@ def _send_and_wait(link, packet, dest, timeout = ACK_TIMEOUT_SECONDS, tries = AC
 
 def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
     """Send packets one at a time, only handing over the next once the last
-    is acknowledged - never more than one packet in flight.
+    is acknowledged - never more than one packet in flight, and never a
+    packet nothing can confirm.
 
     A link of None prints instead of transmitting, so the whole pipeline can
     be exercised without hardware. dest of None looks for the single other
-    node on the mesh; if none can be pinned down, nobody can ack a broadcast,
-    so packets fall back to the old courtesy-paced, unconfirmed send instead.
+    node on the mesh; if none can be pinned down, NOTHING is sent - nobody
+    can ack a broadcast, and a send nothing confirms is worse than no send:
+    it looks like it worked without meaning it.
 
-    Returns how many packets got through. A failed ack stops the rest of the
-    message rather than sending on into a link that is not working.
+    Returns how many packets were actually acknowledged. A failed ack, or no
+    addressable peer at all, stops the rest of the message rather than
+    sending on into a link that is not confirmed to be working.
     """
     if remember:
         remember_sent(packets)
 
-    if dest is None and link is not None:
-        dest = only_peer(link)
-
     total = len(packets)
+
+    if link is None:
+        for position, packet in enumerate(packets):
+            print("  [dry-run] %d/%d %3dB  %s" % (position + 1, total, len(packet), packet.hex()))
+        return total
+
+    if dest is None:
+        dest = only_peer(link)
+    if not dest:
+        print("  no single peer to address; refusing to send unconfirmed")
+        return 0
+
     sent = 0
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))
-        if link is None:
-            print("  [dry-run] %s  %s" % (label, packet.hex()))
-            sent += 1
-            continue
-
-        if dest:
-            if not _send_and_wait(link, packet, dest):
-                print("  FAILED    %s  never acknowledged; stopping" % label)
-                break
-            print("  acked     %s" % label)
-        else:
-            link.sendData(packet)
-            print("  sent      %s  (broadcast, unconfirmed)" % label)
-            if position < total - 1:
-                time.sleep(gap)
+        if not _send_and_wait(link, packet, dest):
+            print("  FAILED    %s  never acknowledged; stopping" % label)
+            break
+        print("  acked     %s" % label)
         sent += 1
 
     return sent
