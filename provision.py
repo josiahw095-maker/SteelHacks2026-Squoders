@@ -24,6 +24,25 @@ URL_FILE = "channel.url"
 BACKUP_FILE = "channel.backup.url"
 DEFAULT_PSK = b"\x01"
 
+# "Never" for a broadcast-interval field. 0 does not mean off here - it means
+# "use the firmware default" (900s for nodeinfo, 15 minutes for position), so
+# a real send still happens. A very large interval is the documented way to
+# suppress it in practice; nothing forces these to fire sooner.
+NEVER_SECONDS = 0xFFFFFFFF
+
+
+def Quiet(iface):
+    """Stop a node announcing itself on its own schedule.
+
+    Our own data packets are all this mesh should be carrying - not periodic
+    NodeInfo or Position broadcasts nobody asked for, which just compete with
+    them for airtime.
+    """
+    iface.localNode.localConfig.device.node_info_broadcast_secs = NEVER_SECONDS
+    iface.localNode.writeConfig("device")
+    iface.localNode.localConfig.position.position_broadcast_secs = NEVER_SECONDS
+    iface.localNode.writeConfig("position")
+
 
 def Connect(port, tries=12):
     """Open a serial connection, retrying while a node reboots."""
@@ -81,6 +100,10 @@ def Main():
     with open(URL_FILE, "w", encoding="utf-8") as f:
         f.write(url + "\n")
     print(f"new channel '{args.name}' applied to both nodes; URL saved to {URL_FILE} (not shown)")
+
+    Quiet(a)
+    Quiet(b)
+    print("nodeinfo and position broadcasts disabled on both nodes")
 
     time.sleep(3)
     a.close()
