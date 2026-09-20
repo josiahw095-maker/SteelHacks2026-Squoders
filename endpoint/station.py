@@ -284,11 +284,10 @@ class Station:
     # --- what the UI writes ------------------------------------------------
 
     def Send(self, packets, gap = 2.0, on_progress = None):
-        """Put packets on the air, one at a time, never advancing to the next
-        until the last is acknowledged. Refuses to send anything at all if
-        the gateway cannot be addressed directly - nobody can ack a
-        broadcast, and a send nothing confirms is worse than no send: it
-        looks like it worked without meaning it.
+        """Put packets on the air, waiting after each for the radio's own TX
+        queue to report empty before handing over the next - never more than
+        one packet outstanding at once, confirmed by the device itself
+        rather than guessed at with a fixed delay.
 
         Chase(), Reply() and Compose() all call this from whatever HTTP
         request thread happens to invoke them, and the browser can have
@@ -313,20 +312,12 @@ class Station:
                     report(position + 1)
                 return total
 
-            dest = MeshSend.only_peer(self.link)
-            if not dest:
-                self.Note("ask", "no single peer to address; refusing to send unconfirmed")
-                return 0
-
-            sent = 0
             for position, packet in enumerate(packets):
-                if not MeshSend._send_and_wait(self.link, packet, dest):
-                    self.Note("ask", f"packet {position + 1}/{total} never acknowledged; stopping")
-                    break
+                self.link.sendData(packet)
                 self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
                 report(position + 1)
-                sent += 1
-            return sent
+                MeshSend.wait_for_clear_queue(self.link)
+            return total
 
     def Reply(self, thread, body, on_progress = None):
         """Reply into a conversation. thread is the 16-bit hash we received."""

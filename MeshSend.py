@@ -8,12 +8,37 @@ The packets are raw bytes, so they go out with sendData on the private port
 """
 
 import struct
-import threading
+import time
 from collections import OrderedDict
 
-# Courtesy gap between packets. A full 200-byte packet is roughly 2 s of
-# airtime at LONG_FAST, and every hop rebroadcasts what it hears.
+# Fallback pacing, used only when the radio never reports a queue depth at
+# all (old firmware). A full 200-byte packet is roughly 2 s of airtime at
+# LONG_FAST, and every hop rebroadcasts what it hears.
 SEND_GAP_SECONDS = 2.0
+
+# How long to wait for the device's own TX queue to report empty before
+# giving up and moving on anyway - a jammed queue would otherwise stall the
+# whole message forever - and how often to check.
+QUEUE_CLEAR_TIMEOUT = 10.0
+QUEUE_POLL_SECONDS = 0.1
+
+
+def wait_for_clear_queue(link, timeout = QUEUE_CLEAR_TIMEOUT, poll = QUEUE_POLL_SECONDS):
+    """Block until the radio's own TX queue reports empty.
+
+    This is what actually gates "one packet at a time": queueStatus.free is
+    real feedback from the device about what it has and has not transmitted
+    yet, not a guess about airtime. If this firmware never reports a queue
+    depth at all (queueStatus stays None), there is nothing to wait on, and
+    the caller's own SEND_GAP_SECONDS pause is the only pacing available.
+    """
+    if getattr(link, "queueStatus", None) is None:
+        time.sleep(SEND_GAP_SECONDS)
+        return
+    waited = 0.0
+    while link.queueStatus.free < link.queueStatus.maxlen and waited < timeout:
+        time.sleep(poll)
+        waited += poll
 
 
 def scan():
@@ -78,113 +103,31 @@ def resend(link, group, wanted, gap = SEND_GAP_SECONDS, dest = None):
     return len(chosen)
 
 
-def peers(link):
-    """Other nodes this radio has heard, as [(id, name)], nearest-known first.
-
-    Meshtastic fills interface.nodes in as node-info packets arrive, so this
-    grows over the first minute or two after connecting. Our own node is left
-    out: there is no point addressing ourselves.
-    """
-    nodes = getattr(link, "nodes", None) or {}
-    mine = None
-    try:
-        mine = link.getMyNodeInfo()["user"]["id"]
-    except Exception:
-        pass
-
-    found = []
-    for node_id, node in nodes.items():
-        if node_id == mine:
-            continue
-        user = node.get("user", {}) or {}
-        found.append((node_id, user.get("longName") or user.get("shortName") or node_id))
-    return sorted(found, key=lambda pair: pair[1].lower())
-
-
-def only_peer(link):
-    """The single other node, when there is exactly one. Otherwise None.
-
-    On a two-node mesh this is what "dynamic" means in practice: nobody has
-    to type an id, and adding a third node makes the choice explicit rather
-    than silently picking wrong.
-    """
-    found = peers(link)
-    return found[0][0] if len(found) == 1 else None
-
-
-# How long to wait for a single packet's ack before retrying, and how many
-# tries before giving up on it (and the rest of the message with it).
-ACK_TIMEOUT_SECONDS = 8.0
-ACK_TRIES = 3
-
-
-def _send_and_wait(link, packet, dest, timeout = ACK_TIMEOUT_SECONDS, tries = ACK_TRIES):
-    """Send one packet to dest and block until the firmware confirms it,
-    retrying on timeout. Returns True once acked, False if every try failed.
-
-    Only meaningful for an addressed packet - nobody can ack a broadcast, so
-    this is not used when dest is unknown.
-    """
-    for attempt in range(1, tries + 1):
-        acked = threading.Event()
-        outcome = []
-
-        def on_response(reply):
-            # Called on the radio's own thread once the ack (or nak) arrives.
-            routing = ((reply or {}).get("decoded") or {}).get("routing") or {}
-            outcome.append(routing.get("errorReason", "NONE"))
-            # Who actually answered - worth knowing if a packet is later found
-            # missing at the real destination despite a clean ack here.
-            print("  ack from  %s: %s" % ((reply or {}).get("fromId"), outcome[-1]))
-            acked.set()
-
-        link.sendData(packet, destinationId = dest, wantAck = True,
-                     onResponse = on_response, onResponseAckPermitted = True)
-        if acked.wait(timeout) and outcome and outcome[0] == "NONE":
-            return True
-        print("  no ack (attempt %d/%d)%s" % (attempt, tries,
-              "" if not outcome else ": " + outcome[0]))
-    return False
-
-
 def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
-    """Send packets one at a time, only handing over the next once the last
-    is acknowledged - never more than one packet in flight, and never a
-    packet nothing can confirm.
+    """Send packets one at a time, waiting after each for the radio's own TX
+    queue to report empty before handing over the next - never more than one
+    packet outstanding at once, confirmed by the device itself rather than
+    guessed at with a fixed delay.
 
     A link of None prints instead of transmitting, so the whole pipeline can
-    be exercised without hardware. dest of None looks for the single other
-    node on the mesh; if none can be pinned down, NOTHING is sent - nobody
-    can ack a broadcast, and a send nothing confirms is worse than no send:
-    it looks like it worked without meaning it.
-
-    Returns how many packets were actually acknowledged. A failed ack, or no
-    addressable peer at all, stops the rest of the message rather than
-    sending on into a link that is not confirmed to be working.
+    be exercised without hardware. dest of None broadcasts to the channel;
+    an explicit dest addresses one node.
     """
     if remember:
         remember_sent(packets)
 
     total = len(packets)
-
-    if link is None:
-        for position, packet in enumerate(packets):
-            print("  [dry-run] %d/%d %3dB  %s" % (position + 1, total, len(packet), packet.hex()))
-        return total
-
-    if dest is None:
-        dest = only_peer(link)
-    if not dest:
-        print("  no single peer to address; refusing to send unconfirmed")
-        return 0
-
-    sent = 0
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))
-        if not _send_and_wait(link, packet, dest):
-            print("  FAILED    %s  never acknowledged; stopping" % label)
-            break
-        print("  acked     %s" % label)
-        sent += 1
+        if link is None:
+            print("  [dry-run] %s  %s" % (label, packet.hex()))
+            continue
 
-    return sent
+        if dest:
+            link.sendData(packet, destinationId = dest)
+        else:
+            link.sendData(packet)
+        print("  sent      %s" % label)
+        wait_for_clear_queue(link)
+
+    return total
