@@ -44,15 +44,20 @@ PREAMBLE_SYMBOLS = 16
 # airtime * (100/this - 1), so this is the only dial that moves the gap
 # without changing the modem preset.
 #
-# 10% is ordinary LoRa manners and was where this mesh was proved to work:
-# free held at 15/16 all the way through a 7-packet message. 14.3% takes a
-# third off the gap - 16.83 s down to 11.21 s at LONG_FAST - and is a
-# deliberate step toward the point where the radio stops keeping up, not a
-# setting anyone should assume is safe. Watch free in the send log: holding
-# near maxlen means the radio is draining what it is given, counting down
-# means it is not, and at that point this number is too high. Saturation is
-# what wedged this mesh before, at ~93% of the channel.
-DUTY_CYCLE_PERCENT = 14.3
+# 10% is ordinary LoRa manners, and it is the only value this mesh has been
+# measured good at: free held near 15/16 through a whole 7-packet message.
+#
+# 14.3% was tried and put back. It takes a third off the gap - 16.83 s down
+# to 11.21 s at LONG_FAST - but free counted 15, 14, 13, 12, 11 straight
+# down during a single send, which means the radio was being handed packets
+# faster than it could get them on the air. That is the same direction of
+# travel that ended in a wedged queue at ~93% of the channel, so it is not
+# a knob to turn up hopefully. Watch free in the send log: holding near
+# maxlen means the radio is keeping up, counting down means this is too
+# high. Note also that free counting down is not proof WE are at fault -
+# the channel can be busy with someone else's traffic, which is what
+# describe_channel() below is for.
+DUTY_CYCLE_PERCENT = 10
 
 # Which preset the radio is actually on, learned at open_link(). Airtime
 # differs by more than 10x across the presets, so guessing is not an option.
