@@ -293,7 +293,9 @@ class Station:
             return total
 
         for position, packet in enumerate(packets):
-            self.link.sendData(packet, wantAck = True)
+            # Broadcast: nobody can ack it, and asking anyway makes the
+            # firmware retransmit it on its own, colliding with our pacing.
+            self.link.sendData(packet)
             self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
             report(position + 1)
             if position < total - 1:

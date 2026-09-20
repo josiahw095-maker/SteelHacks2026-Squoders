@@ -130,7 +130,10 @@ def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
             if dest:
                 link.sendData(packet, destinationId=dest, wantAck=True)
             else:
-                link.sendData(packet, wantAck=True)
+                # Nobody can ack a broadcast. Asking anyway makes the firmware
+                # retransmit it up to three more times on its own, which
+                # collides with our own steady pacing on an already busy channel.
+                link.sendData(packet)
             print("  sent      %s" % label)
 
         if position < total - 1:
