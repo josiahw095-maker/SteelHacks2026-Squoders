@@ -17,6 +17,7 @@ Use "loopback" wherever a port name is expected:
 """
 
 import itertools
+import threading
 import time
 from pathlib import Path
 
@@ -57,6 +58,9 @@ class LoopbackInterface:
         for box in (self.send_box, self.recv_box):
             box.mkdir(parents = True, exist_ok = True)
         self.seen = set()
+        # Claiming a file and recording it must be one step: two callers
+        # polling at once would otherwise both claim the same packet.
+        self.lock = threading.Lock()
 
     # --- the bits MeshSend and Station call ------------------------------
 
@@ -76,14 +80,16 @@ class LoopbackInterface:
     def Receive(self):
         """Every packet that has arrived since the last call, oldest first."""
         arrived = []
-        for path in sorted(self.recv_box.glob("*.pkt")):
-            if path.name in self.seen:
-                continue
-            try:
-                arrived.append(path.read_bytes())
-            except OSError:
-                continue          # still being written; pick it up next time
-            self.seen.add(path.name)
+        with self.lock:
+            for path in sorted(self.recv_box.glob("*.pkt")):
+                if path.name in self.seen:
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue      # still being written; pick it up next time
+                self.seen.add(path.name)
+                arrived.append(data)
         return arrived
 
     def Sweep(self, now = None):

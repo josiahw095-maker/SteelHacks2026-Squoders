@@ -24,6 +24,17 @@ GROUP_TIMEOUT = 300
 REQUEST_AFTER = 20
 MAX_REQUESTS = 3
 
+# Lines kept for the live feed on screen.
+MAX_EVENTS = 200
+
+# Chunk ids remembered briefly after decoding, so a late duplicate - a
+# resend that lands once the message is already complete - is dropped rather
+# than starting a phantom group that never finishes. It has to EXPIRE: the
+# same email sent again later is a real message, not a duplicate, and the id
+# is only 16 bits so it will legitimately come round again.
+DONE_WINDOW = 45
+MAX_DONE = 60
+
 
 class Station:
     """One connection to the end node, plus everything heard so far."""
@@ -35,6 +46,8 @@ class Station:
         self.messages = []          # decoded inbound mail, oldest first
         self.groups = {}            # packets still waiting for their siblings
         self.sent = []              # what we pushed back, for the UI to show
+        self.events = []            # a running log for the screen
+        self.done = {}              # chunk id -> when it was decoded
         self.link = None
         self.node_id = None
         self.error = None
@@ -88,7 +101,16 @@ class Station:
         key = bytes(payload[:2])
 
         with self.lock:
+            seen_at = self.done.get(key)
+            if seen_at is not None and time.time() - seen_at < DONE_WINDOW:
+                return None                  # a late duplicate of that message
+
+        self.Note("rx", f"packet in  ({key.hex()})", len(payload))
+
+        with self.lock:
             group = self.groups.setdefault(key, {"packets": [], "seen": 0.0})
+            if bytes(payload) in group["packets"]:
+                return None                  # same packet twice; ignore
             group["packets"].append(bytes(payload))
             group["seen"] = time.time()
             data = MeshCodec.reassemble(group["packets"])
@@ -98,6 +120,12 @@ class Station:
             packet_count = len(group["packets"])
             air_bytes = sum(len(p) for p in group["packets"])
             del self.groups[key]
+            now = time.time()
+            self.done[key] = now
+            if len(self.done) > MAX_DONE:
+                for stale in [k for k, t in self.done.items()
+                              if now - t > DONE_WINDOW][:len(self.done) - MAX_DONE]:
+                    del self.done[stale]
 
         try:
             message = MeshCodec.decode_message(data)
@@ -107,6 +135,7 @@ class Station:
         if message["outbound"]:
             return None                      # our own send heard back
 
+        self.Note("mail", f"decoded: {message['subject'] or '(no subject)'}", air_bytes)
         message["at"] = time.time()
         message["packets"] = packet_count
         message["airbytes"] = air_bytes
@@ -119,6 +148,43 @@ class Station:
         with self.lock:
             self.messages.append(message)
         return message
+
+    def Note(self, kind, text, bytes_ = 0):
+        """Record one line for the live feed the browser shows.
+
+        Bounded, because this runs for the length of a demo and nobody wants
+        an endpoint that slowly eats memory.
+        """
+        with self.lock:
+            self.events.append({"at": time.time(), "kind": kind,
+                                "text": text, "bytes": bytes_})
+            if len(self.events) > MAX_EVENTS:
+                del self.events[:len(self.events) - MAX_EVENTS]
+
+    def Feed(self, limit = 40):
+        with self.lock:
+            return list(self.events[-limit:])[::-1]
+
+    def Close(self):
+        """Let go of the radio so another connection can take its place.
+
+        The pubsub subscription has to go first: a Station that is still
+        listening keeps receiving into an inbox nobody is looking at, and
+        those stale listeners pile up every time the transport is switched.
+        """
+        try:
+            from pubsub import pub
+            pub.unsubscribe(self.OnReceive, "meshtastic.receive")
+        except Exception:
+            pass
+
+        link, self.link = self.link, None
+        if link is not None and hasattr(link, "close"):
+            # BLEInterface.close() can wait forever on Windows, so give the
+            # disconnect ten seconds and then abandon it.
+            closer = threading.Thread(target = link.close, daemon = True)
+            closer.start()
+            closer.join(10)
 
     def Poll(self):
         """Pull packets in when there is no callback (the mock radio).
@@ -159,6 +225,7 @@ class Station:
                 asks.append((int.from_bytes(key, "big"), missing))
 
         for group_id, missing in asks:
+            self.Note("ask", f"asked for parts {missing} of {group_id:04x}")
             self.Send(MeshCodec.request_packets(group_id, missing))
         return asks
 
@@ -227,6 +294,7 @@ class Station:
 
         for position, packet in enumerate(packets):
             self.link.sendData(packet, wantAck = True)
+            self.Note("tx", f"packet out ({position + 1}/{total})", len(packet))
             report(position + 1)
             if position < total - 1:
                 time.sleep(gap)
