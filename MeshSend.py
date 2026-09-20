@@ -40,10 +40,19 @@ DEFAULT_PRESET = "LONG_FAST"        # what a node ships with
 MESH_HEADER = 16                    # bytes the firmware wraps around our payload
 PREAMBLE_SYMBOLS = 16
 
-# The share of the channel one node may take. 10% is ordinary LoRa manners,
-# and it keeps us well clear of the firmware's own airtime governor. Raising
-# it does not make a message arrive sooner; past a point it stops arriving.
-DUTY_CYCLE_PERCENT = 10
+# The share of the channel one node may take. The gap after a packet is
+# airtime * (100/this - 1), so this is the only dial that moves the gap
+# without changing the modem preset.
+#
+# 10% is ordinary LoRa manners and was where this mesh was proved to work:
+# free held at 15/16 all the way through a 7-packet message. 14.3% takes a
+# third off the gap - 16.83 s down to 11.21 s at LONG_FAST - and is a
+# deliberate step toward the point where the radio stops keeping up, not a
+# setting anyone should assume is safe. Watch free in the send log: holding
+# near maxlen means the radio is draining what it is given, counting down
+# means it is not, and at that point this number is too high. Saturation is
+# what wedged this mesh before, at ~93% of the channel.
+DUTY_CYCLE_PERCENT = 14.3
 
 # Which preset the radio is actually on, learned at open_link(). Airtime
 # differs by more than 10x across the presets, so guessing is not an option.
@@ -109,12 +118,32 @@ QUEUE_FLOOR = 2
 _queue_timeouts = 0
 _queue_trusted = True
 
+# Airtime we still owe the channel: the moment we may next transmit. The
+# silence after a packet is a debt, not part of sending it. Sleeping it
+# where it is incurred charges every message for a gap after its LAST
+# packet, which delays nothing except a message that may never come - 16.8 s
+# added to how long every email takes to arrive, for nothing. So it is
+# recorded here and paid at the start of the next send instead.
+_quiet_until = 0.0
+
 
 def forget_queue_trust():
-    """Believe the queue again. Call when a different radio is opened - the
-    next one may be firmware that does report the drain."""
-    global _queue_timeouts, _queue_trusted
-    _queue_timeouts, _queue_trusted = 0, True
+    """Believe the queue again, and owe it nothing. Call when a different
+    radio is opened - the next one may report its drain, and it is certainly
+    not owed silence for what some other radio transmitted."""
+    global _queue_timeouts, _queue_trusted, _quiet_until
+    _queue_timeouts, _queue_trusted, _quiet_until = 0, True, 0.0
+
+
+def pace_before(link):
+    """Wait out airtime still owed from an earlier packet. Returns seconds."""
+    if getattr(link, "no_airtime", False):
+        return 0.0
+    owed = _quiet_until - time.time()
+    if owed <= 0:
+        return 0.0
+    time.sleep(owed)
+    return owed
 
 
 def queue_backed_up(link):
@@ -133,24 +162,46 @@ def describe_queue(link):
                                  ", res %d" % status.res if status.res else "")
 
 
+def describe_channel(link):
+    """What the radio says the airwaves look like, as the firmware sees them.
+
+    chan is how much of the time the channel is busy with ANY traffic -
+    ours, the peer's, other people's meshes, interference. ours is how much
+    of it is this node transmitting. The gap between the two is the number
+    that matters when packets go missing: a high chan with a low ours means
+    the air is full of something we are not sending, and no amount of
+    pacing on our side will make room.
+    """
+    try:
+        metrics = link.getMyNodeInfo().get("deviceMetrics", {})
+    except Exception:
+        return ""
+    chan, ours = metrics.get("channelUtilization"), metrics.get("airUtilTx")
+    if chan is None and ours is None:
+        return ""
+    return "  chan %.0f%%/ours %.0f%%" % (chan or 0.0, ours or 0.0)
+
+
 def pace_after(link, packet_bytes, timeout = QUEUE_CLEAR_TIMEOUT,
                poll = QUEUE_POLL_SECONDS):
-    """Wait long enough after a packet before offering the radio the next.
+    """Book what a just-sent packet costs the channel, and check the radio
+    is keeping up.
 
-    The airtime gap is the floor and always applies: a queue that drains in
-    300 ms does not mean we may transmit again in 300 ms. On top of that, if
-    this firmware reports its queue draining, we also wait for that, so we
-    never hand over a packet while one is genuinely still outstanding.
+    The silence itself is not slept here - it is recorded as a debt that
+    pace_before() pays at the start of the next send. A queue that drains in
+    300 ms does not mean we may transmit again in 300 ms; the airtime gap is
+    what decides that, and it is owed whatever the queue says.
 
-    Returns (seconds waited, whether the queue check timed out).
+    Returns (seconds spent watching the queue, whether that check timed out).
     """
-    global _queue_timeouts, _queue_trusted
+    global _queue_timeouts, _queue_trusted, _quiet_until
 
     # A spool folder has no channel to share; pacing it would be theatre.
     if getattr(link, "no_airtime", False):
         return 0.0, False
 
     gap = gap_for(packet_bytes)
+    _quiet_until = time.time() + gap
     start = time.time()
     timed_out = False
 
@@ -175,9 +226,6 @@ def pace_after(link, packet_bytes, timeout = QUEUE_CLEAR_TIMEOUT,
         else:
             _queue_timeouts = 0        # it drained; the signal is real after all
 
-    short_by = gap - (time.time() - start)
-    if short_by > 0:
-        time.sleep(short_by)
     return time.time() - start, timed_out
 
 
@@ -266,7 +314,11 @@ def send_packets(link, packets, dest=None, remember=True):
 
     total = len(packets)
     for position, packet in enumerate(packets):
-        label = "%d/%d %3dB" % (position + 1, total, len(packet))
+        # Which PART this is, not just where it sits in this batch: on a
+        # resend "1/2" says nothing, and "part 6 of 7" is the whole question.
+        _, pt = struct.unpack(">HB", packet[:3])
+        label = "%d/%d part %d of %d %3dB" % (position + 1, total,
+                                              (pt >> 4) + 1, pt & 0x0F, len(packet))
         if link is None:
             print("  [dry-run] %s  %s" % (label, packet.hex()))
             continue
@@ -274,6 +326,8 @@ def send_packets(link, packets, dest=None, remember=True):
         # A radio that is sitting on undelivered packets will not be helped
         # by another one, and at zero free slots sendData() blocks forever
         # inside the library. Stop while the answer is still a message.
+        pace_before(link)         # airtime still owed from the last packet
+
         if queue_backed_up(link):
             print("  STOPPED at %s: the radio is holding packets it has not "
                   "transmitted%s. The channel is saturated - see "
@@ -285,9 +339,10 @@ def send_packets(link, packets, dest=None, remember=True):
             link.sendData(packet, destinationId = dest)
         else:
             link.sendData(packet)
-        waited, timed_out = pace_after(link, len(packet))
-        print("  sent      %s  waited %5.2f s%s%s"
-              % (label, waited, describe_queue(link),
+        _, timed_out = pace_after(link, len(packet))
+        print("  sent      %s%s%s  next in %5.2f s%s"
+              % (label, describe_queue(link), describe_channel(link),
+                 gap_for(len(packet)),
                  "   queue never reported empty" if timed_out else ""))
 
     return total

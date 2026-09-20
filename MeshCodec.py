@@ -334,6 +334,20 @@ def missing_parts(packets):
     return sorted(set(range(total)) - parts)
 
 
+def highest_part(packets):
+    """The highest part index present, or -1 for none.
+
+    A sender transmits parts in order, so this is the line between "lost"
+    and "not sent yet": a part below it that is absent is genuinely missing,
+    while a part above it may simply still be on its way.
+    """
+    high = -1
+    for packet in packets:
+        _, pt = struct.unpack(">HB", packet[:HEADER])
+        high = max(high, pt >> 4)
+    return high
+
+
 def request_packets(group_id, wanted):
     """Ask the far side to resend particular parts of one message.
 

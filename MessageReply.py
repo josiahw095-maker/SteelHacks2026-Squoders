@@ -99,6 +99,12 @@ def OnReceive(packet, interface = None):
         return
     payload = decoded.get("payload")
     if payload:
+        # The reverse link's quality, for the same reason the endpoint logs
+        # it: when packets go missing, how the ones that DID arrive sounded
+        # is the difference between a weak link and a saturated one.
+        snr, rssi = packet.get("rxSnr"), packet.get("rxRssi")
+        if snr is not None or rssi is not None:
+            print(f"  heard a packet: snr {snr} rssi {rssi}")
         Collect(payload)
 
 

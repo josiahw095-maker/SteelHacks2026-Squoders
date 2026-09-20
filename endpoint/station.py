@@ -20,10 +20,35 @@ import MeshSend
 # A half-received message is forgotten after this long.
 GROUP_TIMEOUT = 300
 
-# How long a message may stall before we ask for the missing parts, and
-# how many times we are willing to ask.
-REQUEST_AFTER = 20
+# How many times we are willing to ask for missing parts.
 MAX_REQUESTS = 3
+
+# How long a message may stall before we ask. This CANNOT be a constant:
+# it has to stay comfortably above the gap the sender leaves between
+# packets, and that gap is now airtime, so it moves with the modem preset.
+# At LONG_FAST the gateway leaves 16.8 s between packets and the endpoint
+# sees them 18.7 s apart - against which the old flat 20 s left 1.3 s of
+# margin, so nearly every long message got chased while it was still
+# arriving perfectly well.
+#
+# A spurious chase is not free. This radio is half-duplex: while it
+# transmits a request it cannot hear, so an ask sent into the middle of an
+# incoming message can cost us the very packet we were waiting for - and
+# that loss triggers another ask. Long messages fail from the back end
+# first, which is exactly the shape of the trouble.
+REQUEST_MARGIN = 3.0        # multiples of the sender's inter-packet gap
+REQUEST_AFTER_FLOOR = 30.0
+
+
+def SendInterval():
+    """How far apart a sender leaves its packets, at the current preset."""
+    return (MeshSend.gap_for(MeshCodec.MAX_PAYLOAD)
+            + MeshSend.airtime_seconds(MeshCodec.MAX_PAYLOAD + MeshSend.MESH_HEADER))
+
+
+def RequestAfter():
+    """Seconds of silence that mean a message really has stalled."""
+    return max(REQUEST_AFTER_FLOOR, REQUEST_MARGIN * SendInterval())
 
 # Lines kept for the live feed on screen.
 MAX_EVENTS = 200
@@ -97,9 +122,15 @@ class Station:
             return
         payload = decoded.get("payload")
         if payload:
-            self.Accept(payload)
+            # How strong and how clean, as the receiving radio heard it. When
+            # packets go missing this is the first thing worth knowing: a
+            # marginal SNR means they are being lost on the air, while a
+            # very STRONG rssi at close range means the front end is being
+            # overloaded, which costs packets just as surely.
+            self.Accept(payload, snr = packet.get("rxSnr"),
+                        rssi = packet.get("rxRssi"))
 
-    def Accept(self, payload):
+    def Accept(self, payload, snr = None, rssi = None):
         """Feed one packet in. Returns the message if that completed one.
 
         Separate from OnReceive so the endpoint can be driven with bytes in
@@ -112,7 +143,15 @@ class Station:
             if seen_at is not None and time.time() - seen_at < DONE_WINDOW:
                 return None                  # a late duplicate of that message
 
-        self.Note("rx", f"packet in  ({key.hex()})", len(payload))
+        if len(payload) >= 3:
+            part, claimed = payload[2] >> 4, payload[2] & 0x0F
+            where = f"part {part + 1} of {claimed}"
+        else:
+            where = "runt"
+        heard = ""
+        if snr is not None or rssi is not None:
+            heard = f"  snr {snr if snr is not None else '?'}"                     f" rssi {rssi if rssi is not None else '?'}"
+        self.Note("rx", f"packet in  {key.hex()} {where}{heard}", len(payload))
 
         with self.lock:
             group = self.groups.setdefault(key, {"packets": [], "seen": 0.0})
@@ -217,6 +256,8 @@ class Station:
         """
         now = now if now is not None else time.time()
         asks = []
+        request_after = RequestAfter()
+        interval = SendInterval()
 
         # A send already in flight owns the radio. Chasing now would block on
         # send_lock until that send finished - and this runs on the browser's
@@ -233,16 +274,34 @@ class Station:
 
         with self.lock:
             for key, group in self.groups.items():
-                if now - group["seen"] < REQUEST_AFTER:
+                if now - group["seen"] < request_after:
                     continue
                 if group.get("requests", 0) >= MAX_REQUESTS:
                     continue
                 missing = MeshCodec.missing_parts(group["packets"])
                 if not missing:
                     continue
+
+                # Senders transmit in order, so a part below the highest we
+                # have seen is genuinely lost, while a part above it may not
+                # have been sent yet. Asking for packets that are still in
+                # flight doubles the load on the channel that is already the
+                # reason they are late - one stalled message went out as 18
+                # packets instead of 7 that way, and the extra traffic cost
+                # more packets than it recovered.
+                high = MeshCodec.highest_part(group["packets"])
+                outstanding = (missing[-1] - high) * interval
+
+                if now - group["seen"] >= request_after + outstanding:
+                    wanted = missing      # the sender cannot still be going
+                else:
+                    wanted = [part for part in missing if part < high]
+                if not wanted:
+                    continue
+
                 group["requests"] = group.get("requests", 0) + 1
                 group["seen"] = now          # back off before asking again
-                asks.append((int.from_bytes(key, "big"), missing))
+                asks.append((int.from_bytes(key, "big"), wanted))
 
         # One Send() call, not one per group: Send() only paces *between*
         # packets in the same call, and a request is always a single packet.
@@ -334,6 +393,8 @@ class Station:
                 # helped by another one, and at zero free slots sendData()
                 # blocks forever inside the library - which would take this
                 # request thread, and the send_lock, down with it.
+                MeshSend.pace_before(self.link)   # airtime owed from last time
+
                 if MeshSend.queue_backed_up(self.link):
                     self.Note("tx", f"STOPPED at packet {position + 1}/{total}"
                                     f" - the radio is holding packets it has"
@@ -342,11 +403,11 @@ class Station:
 
                 self.link.sendData(packet)
                 report(position + 1)      # the bar moves on the handover...
-                waited, timed_out = MeshSend.pace_after(self.link, len(packet))
-                # ...and the feed line lands once we have waited out this
-                # packet's share of the air, with what that took.
+                _, timed_out = MeshSend.pace_after(self.link, len(packet))
+                # ...and the feed line says what this packet owes the channel
+                # before the next one may go out.
                 self.Note("tx", f"packet out ({position + 1}/{total})"
-                                f" - {waited:.2f} s"
+                                f" - next in {MeshSend.gap_for(len(packet)):.2f} s"
                                 + (" - queue never reported empty" if timed_out
                                    else ""), len(packet))
             return total
