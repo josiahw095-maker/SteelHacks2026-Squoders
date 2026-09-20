@@ -224,9 +224,16 @@ class Station:
                 group["seen"] = now          # back off before asking again
                 asks.append((int.from_bytes(key, "big"), missing))
 
+        # One Send() call, not one per group: Send() only paces *between*
+        # packets in the same call, and a request is always a single packet.
+        # Calling Send() separately per group meant simultaneous stalls fired
+        # back-to-back with no gap between them at all - a burst.
+        packets = []
         for group_id, missing in asks:
             self.Note("ask", f"asked for parts {missing} of {group_id:04x}")
-            self.Send(MeshCodec.request_packets(group_id, missing))
+            packets.extend(MeshCodec.request_packets(group_id, missing))
+        if packets:
+            self.Send(packets)
         return asks
 
     def Expire(self, now = None):

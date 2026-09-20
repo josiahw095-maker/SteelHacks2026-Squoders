@@ -8,6 +8,7 @@ The packets are raw bytes, so they go out with sendData on the private port
 """
 
 import struct
+import threading
 import time
 from collections import OrderedDict
 
@@ -112,28 +113,75 @@ def only_peer(link):
     return found[0][0] if len(found) == 1 else None
 
 
+# How long to wait for a single packet's ack before retrying, and how many
+# tries before giving up on it (and the rest of the message with it).
+ACK_TIMEOUT_SECONDS = 8.0
+ACK_TRIES = 3
+
+
+def _send_and_wait(link, packet, dest, timeout = ACK_TIMEOUT_SECONDS, tries = ACK_TRIES):
+    """Send one packet to dest and block until the firmware confirms it,
+    retrying on timeout. Returns True once acked, False if every try failed.
+
+    Only meaningful for an addressed packet - nobody can ack a broadcast, so
+    this is not used when dest is unknown.
+    """
+    for attempt in range(1, tries + 1):
+        acked = threading.Event()
+        outcome = []
+
+        def on_response(reply):
+            # Called on the radio's own thread once the ack (or nak) arrives.
+            routing = ((reply or {}).get("decoded") or {}).get("routing") or {}
+            outcome.append(routing.get("errorReason", "NONE"))
+            acked.set()
+
+        link.sendData(packet, destinationId = dest, wantAck = True,
+                     onResponse = on_response, onResponseAckPermitted = True)
+        if acked.wait(timeout) and outcome and outcome[0] == "NONE":
+            return True
+        print("  no ack (attempt %d/%d)%s" % (attempt, tries,
+              "" if not outcome else ": " + outcome[0]))
+    return False
+
+
 def send_packets(link, packets, dest=None, gap=SEND_GAP_SECONDS, remember=True):
-    """Send packets in order, pausing between them to limit airtime.
+    """Send packets one at a time, only handing over the next once the last
+    is acknowledged - never more than one packet in flight.
 
     A link of None prints instead of transmitting, so the whole pipeline can
-    be exercised without hardware. dest of None broadcasts to the channel.
+    be exercised without hardware. dest of None looks for the single other
+    node on the mesh; if none can be pinned down, nobody can ack a broadcast,
+    so packets fall back to the old courtesy-paced, unconfirmed send instead.
+
+    Returns how many packets got through. A failed ack stops the rest of the
+    message rather than sending on into a link that is not working.
     """
     if remember:
         remember_sent(packets)
 
+    if dest is None and link is not None:
+        dest = only_peer(link)
+
     total = len(packets)
+    sent = 0
     for position, packet in enumerate(packets):
         label = "%d/%d %3dB" % (position + 1, total, len(packet))
         if link is None:
             print("  [dry-run] %s  %s" % (label, packet.hex()))
+            sent += 1
+            continue
+
+        if dest:
+            if not _send_and_wait(link, packet, dest):
+                print("  FAILED    %s  never acknowledged; stopping" % label)
+                break
+            print("  acked     %s" % label)
         else:
-            if dest:
-                link.sendData(packet, destinationId=dest)
-            else:
-                link.sendData(packet)
-            print("  sent      %s" % label)
+            link.sendData(packet)
+            print("  sent      %s  (broadcast, unconfirmed)" % label)
+            if position < total - 1:
+                time.sleep(gap)
+        sent += 1
 
-        if position < total - 1:
-            time.sleep(gap)
-
-    return total
+    return sent
